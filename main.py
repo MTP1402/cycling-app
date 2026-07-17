@@ -267,6 +267,15 @@ async def upload_fit(file: UploadFile = File(...), notes: str = Form(default="")
     data    = await file.read()
     metrics = parse_fit_bytes(data)
     conn = get_db(); cur = conn.cursor()
+    # Deduplication check — same user, date, distance and duration
+    cur.execute("""SELECT id FROM rides WHERE user_id=%s AND ride_date=%s
+        AND ABS(COALESCE(dist_mi,0) - %s) < 0.5
+        AND ABS(COALESCE(duration_h,0) - %s) < 0.1""",
+        (user['id'], metrics['ride_date'], metrics['dist_mi'] or 0, metrics['duration_h'] or 0))
+    existing = cur.fetchone()
+    if existing:
+        cur.close(); conn.close()
+        return {"ride_id": existing[0], "metrics": metrics, "coaching": "Duplicate ride — already in your database.", "duplicate": True}
     cur.execute("""INSERT INTO rides (user_id,ride_date,name,dist_mi,duration_h,
         avg_power,norm_power,avg_hr,max_hr,avg_cadence,max_cadence,p5,p15,p30,temp_c,notes)
         VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
