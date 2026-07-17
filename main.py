@@ -322,6 +322,7 @@ Give a brief 3-4 sentence coaching assessment of this ride. Be direct and specif
         return f"Coaching summary unavailable: {e}"
 
 def build_dashboard_html(rides: list, name: str) -> str:
+    import json as _json
     dates    = [r['ride_date'].strftime('%b %d') if hasattr(r['ride_date'],'strftime') else str(r['ride_date'])[:10] for r in rides]
     avgpwr   = [r['avg_power']   for r in rides]
     np_vals  = [r['norm_power']  for r in rides]
@@ -335,41 +336,62 @@ def build_dashboard_html(rides: list, name: str) -> str:
     p15_mid  = [(b or 0) - (a or 0) for a,b in zip(p30, p15)]
     p5_top   = [(b or 0) - (a or 0) for a,b in zip(p15, p5)]
 
-    return f"""<!DOCTYPE html>
-<html><head><meta charset="UTF-8">
-<title>{name}'s Cycling Dashboard</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
-<style>
-body{{background:#f0f0f0;font-family:Inter,sans-serif;padding:20px;margin:0;}}
-h1{{font-size:20px;font-weight:600;margin-bottom:4px;}}
-.sub{{font-size:12px;color:#888;margin-bottom:20px;}}
-.grid{{display:grid;grid-template-columns:1fr 1fr;gap:12px;}}
-.card{{background:#fff;border:1px solid #e0e0e0;border-radius:8px;padding:16px;}}
-.card h3{{font-size:12px;font-weight:600;color:#333;margin-bottom:8px;}}
-canvas{{width:100%!important;height:200px!important;}}
-</style></head><body>
-<h1>🚴 {name}'s Cycling Dashboard</h1>
-<div class="sub">Updated {date.today().strftime('%B %d, %Y')} · {len(rides)} rides</div>
-<div class="grid">
-<div class="card"><h3>⚡ Avg Power vs Normalized Power (W)</h3><canvas id="pw"></canvas></div>
-<div class="card"><h3>❤️ Avg HR vs Max HR (bpm)</h3><canvas id="hr"></canvas></div>
-<div class="card"><h3>🔄 Avg Cadence vs Max Cadence (rpm)</h3><canvas id="cad"></canvas></div>
-<div class="card"><h3>🏎️ Sprint Power 5s/15s/30s (W)</h3><canvas id="sp"></canvas></div>
-</div>
-<script>
-const L={json(dates)};
-const mkLine=(id,d1,d2,c)=>new Chart(document.getElementById(id),{{type:'line',data:{{labels:L,datasets:[
-  {{label:d1.label,data:d1.data,borderColor:c,backgroundColor:c+'22',borderWidth:2,pointRadius:3,tension:0.3,spanGaps:true}},
-  {{label:d2.label,data:d2.data,borderColor:c,borderDash:[5,4],borderWidth:2,pointRadius:2,tension:0.3,spanGaps:true}}
-]}},options:{{responsive:true,plugins:{{legend:{{display:false}},tooltip:{{mode:'index',intersect:false}}}},scales:{{x:{{ticks:{{font:{{size:9}}}},grid:{{display:false}}}},y:{{ticks:{{font:{{size:9}}}},grid:{{color:'#eee'}}}}}}}}}}});
-mkLine('pw',{{label:'Avg',data:{json(avgpwr)}}},{{label:'NP',data:{json(np_vals)}}},'#3b82f6');
-mkLine('hr',{{label:'Avg HR',data:{json(avghr)}}},{{label:'Max HR',data:{json(maxhr)}}},'#ef4444');
-mkLine('cad',{{label:'Avg Cad',data:{json(avgcad)}}},{{label:'Max Cad',data:{json(maxcad)}}},'#f59e0b');
-const p30={json(p30)},p15={json(p15)},p5={json(p5)};
-new Chart(document.getElementById('sp'),{{type:'bar',data:{{labels:L,datasets:[
-  {{label:'30s',data:{json(p30)},backgroundColor:'#22c55e',stack:'s'}},
-  {{label:'15s',data:{json(p15_mid)},backgroundColor:'#3b82f6',stack:'s'}},
-  {{label:'5s',data:{json(p5_top)},backgroundColor:'#f59e0b',stack:'s'}}
-]}},options:{{responsive:true,plugins:{{legend:{{display:false}},tooltip:{{mode:'index',intersect:false,itemSort:(a,b)=>b.datasetIndex-a.datasetIndex,callbacks:{{label:ctx=>{{const i=ctx.dataIndex;if(ctx.datasetIndex===2)return '5s: '+(p5[i]||'-')+'W';if(ctx.datasetIndex===1)return '15s: '+(p15[i]||'-')+'W';return '30s: '+(p30[i]||'-')+'W';}}}}}}}},scales:{{x:{{stacked:true,ticks:{{font:{{size:9}}}},grid:{{display:false}}}},y:{{stacked:true,ticks:{{font:{{size:9}}}},grid:{{color:'#eee'}}}}}}}}}}});
-</script></body></html>"""
+    d_dates  = _json.dumps(dates)
+    d_avgpwr = _json.dumps(avgpwr)
+    d_np     = _json.dumps(np_vals)
+    d_avghr  = _json.dumps(avghr)
+    d_maxhr  = _json.dumps(maxhr)
+    d_avgcad = _json.dumps(avgcad)
+    d_maxcad = _json.dumps(maxcad)
+    d_p5     = _json.dumps(p5)
+    d_p15    = _json.dumps(p15)
+    d_p30    = _json.dumps(p30)
+    d_p15mid = _json.dumps(p15_mid)
+    d_p5top  = _json.dumps(p5_top)
+    today_str = date.today().strftime('%B %d, %Y')
 
+    return (
+        "<!DOCTYPE html><html><head><meta charset=\"UTF-8\">"
+        "<title>" + name + "'s Cycling Dashboard</title>"
+        "<script src=\"https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js\"></script>"
+        "<style>"
+        "body{background:#f0f0f0;font-family:Inter,sans-serif;padding:20px;margin:0;}"
+        "h1{font-size:20px;font-weight:600;margin-bottom:4px;}"
+        ".sub{font-size:12px;color:#888;margin-bottom:20px;}"
+        ".grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;}"
+        ".card{background:#fff;border:1px solid #e0e0e0;border-radius:8px;padding:16px;}"
+        ".card h3{font-size:12px;font-weight:600;color:#333;margin-bottom:8px;}"
+        "canvas{width:100%!important;height:200px!important;}"
+        "</style></head><body>"
+        "<h1>&#x1F6B4; " + name + "'s Cycling Dashboard</h1>"
+        "<div class=\"sub\">Updated " + today_str + " &middot; " + str(len(rides)) + " rides</div>"
+        "<div class=\"grid\">"
+        "<div class=\"card\"><h3>&#x26A1; Avg Power vs Normalized Power (W)</h3><canvas id=\"pw\"></canvas></div>"
+        "<div class=\"card\"><h3>&#x2764; Avg HR vs Max HR (bpm)</h3><canvas id=\"hr\"></canvas></div>"
+        "<div class=\"card\"><h3>&#x1F504; Avg Cadence vs Max Cadence (rpm)</h3><canvas id=\"cad\"></canvas></div>"
+        "<div class=\"card\"><h3>&#x1F3CE; Sprint Power 5s/15s/30s (W)</h3><canvas id=\"sp\"></canvas></div>"
+        "</div><script>"
+        "const L=" + d_dates + ";"
+        "const mkLine=(id,d1,d2,c)=>new Chart(document.getElementById(id),{type:'line',data:{labels:L,datasets:["
+        "  {label:d1.label,data:d1.data,borderColor:c,backgroundColor:c+'22',borderWidth:2,pointRadius:3,tension:0.3,spanGaps:true},"
+        "  {label:d2.label,data:d2.data,borderColor:c,borderDash:[5,4],borderWidth:2,pointRadius:2,tension:0.3,spanGaps:true}"
+        "]},options:{responsive:true,plugins:{legend:{display:false},tooltip:{mode:'index',intersect:false}},"
+        "scales:{x:{ticks:{font:{size:9}},grid:{display:false}},y:{ticks:{font:{size:9}},grid:{color:'#eee'}}}}});"
+        "mkLine('pw',{label:'Avg',data:" + d_avgpwr + "},{label:'NP',data:" + d_np + "},'#3b82f6');"
+        "mkLine('hr',{label:'Avg HR',data:" + d_avghr + "},{label:'Max HR',data:" + d_maxhr + "},'#ef4444');"
+        "mkLine('cad',{label:'Avg Cad',data:" + d_avgcad + "},{label:'Max Cad',data:" + d_maxcad + "},'#f59e0b');"
+        "const p30=" + d_p30 + ",p15=" + d_p15 + ",p5=" + d_p5 + ";"
+        "new Chart(document.getElementById('sp'),{type:'bar',data:{labels:L,datasets:["
+        "  {label:'30s',data:" + d_p30 + ",backgroundColor:'#22c55e',stack:'s'},"
+        "  {label:'15s',data:" + d_p15mid + ",backgroundColor:'#3b82f6',stack:'s'},"
+        "  {label:'5s',data:" + d_p5top + ",backgroundColor:'#f59e0b',stack:'s'}"
+        "]},options:{responsive:true,plugins:{legend:{display:false},"
+        "tooltip:{mode:'index',intersect:false,itemSort:(a,b)=>b.datasetIndex-a.datasetIndex,"
+        "callbacks:{label:ctx=>{const i=ctx.dataIndex;"
+        "if(ctx.datasetIndex===2)return '5s: '+(p5[i]||'-')+'W';"
+        "if(ctx.datasetIndex===1)return '15s: '+(p15[i]||'-')+'W';"
+        "return '30s: '+(p30[i]||'-')+'W';}}}},"
+        "scales:{x:{stacked:true,ticks:{font:{size:9}},grid:{display:false}},"
+        "y:{stacked:true,ticks:{font:{size:9}},grid:{color:'#eee'}}}}});"
+        "</script></body></html>"
+    )
