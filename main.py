@@ -292,6 +292,13 @@ def add_note(note: str = Form(...), user: dict = Depends(get_current_user)):
     cur.close(); conn.close()
     return {"status": "saved"}
 
+@app.delete("/rides/clear")
+def clear_rides(user: dict = Depends(get_current_user)):
+    conn = get_db(); cur = conn.cursor()
+    cur.execute("DELETE FROM rides WHERE user_id=%s", (user['id'],))
+    cur.close(); conn.close()
+    return {"status": "all rides cleared"}
+
 @app.get("/dashboard", response_class=HTMLResponse)
 def get_dashboard(user: dict = Depends(get_current_user)):
     conn = get_db(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
