@@ -47,6 +47,18 @@ def init_db():
             is_virtual BOOLEAN DEFAULT FALSE, temp_c FLOAT,
             notes TEXT, created_at TIMESTAMP DEFAULT NOW()
         );
+        CREATE TABLE IF NOT EXISTS profiles (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER UNIQUE REFERENCES users(id),
+            age INTEGER, weight_lbs FLOAT, location TEXT,
+            fitness_level TEXT, ftp INTEGER,
+            annual_goal_mi INTEGER, other_goals TEXT,
+            health_notes TEXT, injuries TEXT,
+            heat_tolerance TEXT, medical_clearance BOOLEAN DEFAULT FALSE,
+            interview_complete BOOLEAN DEFAULT FALSE,
+            raw_interview TEXT,
+            updated_at TIMESTAMP DEFAULT NOW()
+        );
         CREATE TABLE IF NOT EXISTS coaching_notes (
             id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id),
             note TEXT, created_at TIMESTAMP DEFAULT NOW()
@@ -631,6 +643,158 @@ def add_note(note: str = Form(...), user: dict = Depends(get_current_user)):
     cur.execute("INSERT INTO coaching_notes (user_id,note) VALUES (%s,%s)", (user['id'],note))
     cur.close(); conn.close()
     return {"status": "saved"}
+
+@app.get("/profile")
+def get_profile(user: dict = Depends(get_current_user)):
+    conn = get_db(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT * FROM profiles WHERE user_id=%s", (user['id'],))
+    profile = cur.fetchone(); cur.close(); conn.close()
+    return {"profile": dict(profile) if profile else None, "name": user['name']}
+
+@app.post("/profile")
+async def save_profile(
+    age: str = Form(default=""),
+    weight_lbs: str = Form(default=""),
+    location: str = Form(default=""),
+    fitness_level: str = Form(default=""),
+    ftp: str = Form(default=""),
+    annual_goal_mi: str = Form(default=""),
+    other_goals: str = Form(default=""),
+    health_notes: str = Form(default=""),
+    injuries: str = Form(default=""),
+    heat_tolerance: str = Form(default=""),
+    medical_clearance: str = Form(default="false"),
+    user: dict = Depends(get_current_user)
+):
+    conn = get_db(); cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO profiles (user_id, age, weight_lbs, location, fitness_level, ftp,
+            annual_goal_mi, other_goals, health_notes, injuries, heat_tolerance,
+            medical_clearance, interview_complete, updated_at)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,true,NOW())
+        ON CONFLICT (user_id) DO UPDATE SET
+            age=EXCLUDED.age, weight_lbs=EXCLUDED.weight_lbs,
+            location=EXCLUDED.location, fitness_level=EXCLUDED.fitness_level,
+            ftp=EXCLUDED.ftp, annual_goal_mi=EXCLUDED.annual_goal_mi,
+            other_goals=EXCLUDED.other_goals, health_notes=EXCLUDED.health_notes,
+            injuries=EXCLUDED.injuries, heat_tolerance=EXCLUDED.heat_tolerance,
+            medical_clearance=EXCLUDED.medical_clearance,
+            interview_complete=true, updated_at=NOW()
+    """, (
+        user['id'],
+        int(age) if age.strip() else None,
+        float(weight_lbs) if weight_lbs.strip() else None,
+        location or None, fitness_level or None,
+        int(ftp) if ftp.strip() else None,
+        int(annual_goal_mi) if annual_goal_mi.strip() else None,
+        other_goals or None, health_notes or None,
+        injuries or None, heat_tolerance or None,
+        medical_clearance.lower() == 'true'
+    ))
+    cur.close(); conn.close()
+    return {"status": "saved"}
+
+@app.post("/interview")
+async def ai_interview(
+    message: str = Form(...),
+    history: str = Form(default="[]"),
+    user: dict = Depends(get_current_user)
+):
+    """Conversational AI entrance interview."""
+    if not ANTHROPIC_KEY:
+        return {"reply": "AI unavailable.", "profile_update": {}}
+    
+    import json as _json
+    
+    # Get existing profile
+    conn = get_db(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT * FROM profiles WHERE user_id=%s", (user['id'],))
+    profile = cur.fetchone()
+    cur.execute("SELECT note FROM coaching_notes WHERE user_id=%s ORDER BY created_at DESC LIMIT 3", (user['id'],))
+    notes = [r['note'] for r in cur.fetchall()]
+    cur.close(); conn.close()
+
+    try:
+        hist = _json.loads(history)
+    except:
+        hist = []
+
+    system_prompt = """You are a friendly cycling coach conducting an intake interview with a new athlete.
+Your goal is to gather key information naturally through conversation:
+- Age and weight
+- Where they ride (city/region/climate — heat, altitude, terrain)
+- Fitness level and cycling experience  
+- FTP if they know it, or riding history
+- Primary goals (mileage target, events, fitness, weight loss)
+- Any injuries, recent illnesses, or medical conditions
+- Heat tolerance and any history of heat-related issues
+- Whether they have medical clearance if they mention serious conditions
+
+IMPORTANT RULES:
+- If they mention any serious cardiac conditions, recent surgery, chest pain during exercise, or uncontrolled medical conditions: ALWAYS say they should consult their doctor before continuing and ask if they have medical clearance.
+- If they mention wanting to lose weight: acknowledge it warmly but note that cycling supports overall health — direct specific dietary advice to a nutritionist.
+- If they mention recent COVID, flu, mono, or similar illness: briefly note the post-viral performance dip and adjust expectations.
+- Keep responses conversational, warm, 2-4 sentences max.
+- After gathering enough info (3-4 exchanges), summarize what you've learned and ask if there's anything else important to share.
+- End by saying their profile has been saved and coaching will be personalized to them.
+
+At the END of your response, on a new line, output a JSON object (and ONLY the JSON, no other text on that line) with any profile fields you extracted:
+{"age":null,"weight_lbs":null,"location":null,"fitness_level":null,"ftp":null,"annual_goal_mi":null,"other_goals":null,"health_notes":null,"injuries":null,"heat_tolerance":null,"medical_clearance":false}
+Only include fields where you extracted real information. Use null for unknown fields."""
+
+    messages = []
+    if not hist:
+        messages.append({
+            "role": "assistant",
+            "content": "Hi " + user['name'] + "! I'm your cycling coach. Before we dive into your rides, I'd love to learn a bit about you. Tell me — how long have you been cycling, and what got you into it?"
+        })
+    
+    for h in hist:
+        messages.append(h)
+    messages.append({"role": "user", "content": message})
+
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01"},
+                json={"model": "claude-sonnet-4-6", "max_tokens": 500,
+                      "system": system_prompt, "messages": messages},
+                timeout=30
+            )
+            full_reply = resp.json()['content'][0]['text']
+    except Exception as e:
+        return {"reply": "Sorry, I had trouble connecting. Please try again.", "profile_update": {}}
+
+    # Extract JSON profile update from last line
+    profile_update = {}
+    lines = full_reply.strip().split('\n')
+    reply_text = full_reply
+    for line in reversed(lines):
+        line = line.strip()
+        if line.startswith('{') and line.endswith('}'):
+            try:
+                extracted = _json.loads(line)
+                profile_update = {k: v for k, v in extracted.items() if v is not None and v != False}
+                reply_text = '\n'.join(lines[:-1]).strip()
+                break
+            except:
+                pass
+
+    # Save any extracted profile fields
+    if profile_update:
+        conn = get_db(); cur = conn.cursor()
+        fields = list(profile_update.keys())
+        vals = [profile_update[f] for f in fields]
+        set_clause = ', '.join(f + '=%s' for f in fields)
+        cur.execute(
+            "INSERT INTO profiles (user_id, " + ', '.join(fields) + ") VALUES (%s" + ',%s'*len(fields) + ") "
+            "ON CONFLICT (user_id) DO UPDATE SET " + set_clause + ", updated_at=NOW()",
+            [user['id']] + vals + vals
+        )
+        cur.close(); conn.close()
+
+    return {"reply": reply_text, "profile_update": profile_update}
 
 @app.delete("/rides/clear")
 def clear_rides(user: dict = Depends(get_current_user)):
