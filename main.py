@@ -124,8 +124,20 @@ def parse_fit_bytes(data):
         start   = session.get('start_time')
         dist    = session.get('total_distance')
         elapsed = session.get('total_elapsed_time')
-        sport   = str(session.get('sport', '')).lower()
-        is_virtual = 'virtual' in sport or 'indoor' in sport or 'zwift' in sport.lower()
+        sport      = str(session.get('sport', '')).lower()
+        sub_sport  = str(session.get('sub_sport', '')).lower()
+        # Check file_id for manufacturer (Zwift shows as manufacturer=zwift)
+        manufacturer = ''
+        for msg2 in ff.get_messages('file_id'):
+            for f2 in msg2.fields:
+                if f2.name == 'manufacturer' and f2.value:
+                    manufacturer = str(f2.value).lower()
+        is_virtual = (
+            'virtual' in sport or 'indoor' in sport
+            or 'virtual' in sub_sport
+            or 'zwift' in manufacturer
+            or 'zwift' in sport
+        )
 
         dist_mi   = round(dist/1609.34, 2) if dist else None
         duration_h = round(elapsed/3600, 2) if elapsed else None
