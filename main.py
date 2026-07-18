@@ -543,20 +543,46 @@ async def get_coaching_summary(user, metrics):
         recent = [dict(r) for r in cur.fetchall()]
         cur.execute("SELECT note FROM coaching_notes WHERE user_id=%s ORDER BY created_at DESC LIMIT 5", (user['id'],))
         notes = [r['note'] for r in cur.fetchall()]
+        cur.execute("SELECT * FROM profiles WHERE user_id=%s", (user['id'],))
+        profile = cur.fetchone()
         cur.close(); conn.close()
+
+        profile_ctx = ""
+        if profile:
+            profile_ctx = "RIDER PROFILE:\n"
+            if profile.get('age'):          profile_ctx += "- Age: " + str(profile['age']) + "\n"
+            if profile.get('weight_lbs'):   profile_ctx += "- Weight: " + str(profile['weight_lbs']) + " lbs\n"
+            if profile.get('location'):     profile_ctx += "- Location: " + str(profile['location']) + "\n"
+            if profile.get('fitness_level'):profile_ctx += "- Fitness: " + str(profile['fitness_level']) + "\n"
+            if profile.get('ftp'):          profile_ctx += "- FTP: " + str(profile['ftp']) + "W\n"
+            if profile.get('annual_goal_mi'):profile_ctx += "- Annual goal: " + str(profile['annual_goal_mi']) + " mi\n"
+            if profile.get('other_goals'):  profile_ctx += "- Goals: " + str(profile['other_goals']) + "\n"
+            if profile.get('health_notes'): profile_ctx += "- Health: " + str(profile['health_notes']) + "\n"
+            if profile.get('injuries'):     profile_ctx += "- Injuries: " + str(profile['injuries']) + "\n"
+            if profile.get('heat_tolerance'):profile_ctx += "- Heat tolerance: " + str(profile['heat_tolerance']) + "\n"
+
+        recent_ctx = ""
+        if recent:
+            recent_ctx = "RECENT RIDES (last 10):\n"
+            for r in recent[:5]:
+                recent_ctx += "- " + str(r.get('ride_date',''))[:10] + ": " + str(r.get('dist_mi','')) + "mi, HR " + str(r.get('avg_hr','')) + ", pwr " + str(r.get('avg_power','')) + "W\n"
+
         prompt = (
-            "Rider: " + user['name'] + "\n"
-            + ("Personal notes: " + "; ".join(notes) + "\n" if notes else "")
-            + "Latest ride: " + str(metrics.get('ride_date',''))
-            + ", " + str(metrics.get('dist_mi','')) + " mi"
-            + ", avg power " + str(metrics.get('avg_power','')) + "W"
-            + ", NP " + str(metrics.get('norm_power','')) + "W"
-            + ", avg HR " + str(metrics.get('avg_hr','')) + " bpm"
-            + ", max HR " + str(metrics.get('max_hr','')) + " bpm"
-            + ", cadence " + str(metrics.get('avg_cadence','')) + " rpm"
-            + ", elevation " + str(metrics.get('elev_gain_ft','')) + " ft"
-            + ", temp " + str(metrics.get('temp_c','')) + "C\n"
-            "Give a 3-4 sentence coaching assessment. Be direct and specific."
+            profile_ctx + "\n"
+            + ("PERSONAL NOTES: " + "; ".join(notes) + "\n\n" if notes else "")
+            + recent_ctx + "\n"
+            + "LATEST RIDE:\n"
+            + "- Date: " + str(metrics.get('ride_date','')) + "\n"
+            + "- Distance: " + str(metrics.get('dist_mi','')) + " mi\n"
+            + "- Avg power: " + str(metrics.get('avg_power','')) + "W, NP: " + str(metrics.get('norm_power','')) + "W\n"
+            + "- Avg HR: " + str(metrics.get('avg_hr','')) + " bpm, Max HR: " + str(metrics.get('max_hr','')) + " bpm\n"
+            + "- Cadence: " + str(metrics.get('avg_cadence','')) + " rpm\n"
+            + "- Elevation: " + str(metrics.get('elev_gain_ft','')) + " ft\n"
+            + "- Temp: " + str(metrics.get('temp_c','')) + "C\n\n"
+            + "Give a 3-4 sentence coaching assessment personalized to this rider. "
+            + "Reference their specific situation — age, recovery status, heat, goals. Be direct and specific. "
+            + "If they mentioned recent illness or injury, factor that in. "
+            + "End with one actionable recommendation for their next ride."
         )
         async with httpx.AsyncClient() as client:
             resp = await client.post(
