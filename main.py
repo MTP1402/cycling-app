@@ -732,20 +732,37 @@ async def ai_interview(
     
     import json as _json
     
-    # Get existing profile
+    # Get existing profile and notes
     conn = get_db(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("SELECT * FROM profiles WHERE user_id=%s", (user['id'],))
     profile = cur.fetchone()
-    cur.execute("SELECT note FROM coaching_notes WHERE user_id=%s ORDER BY created_at DESC LIMIT 3", (user['id'],))
+    cur.execute("SELECT note FROM coaching_notes WHERE user_id=%s ORDER BY created_at DESC LIMIT 5", (user['id'],))
     notes = [r['note'] for r in cur.fetchall()]
     cur.close(); conn.close()
+
+    # Build profile context for system prompt
+    profile_ctx = ""
+    if profile:
+        profile_ctx = "\n\nEXISTING RIDER PROFILE (already on file — do not ask for this again):\n"
+        if profile.get('age'):           profile_ctx += "- Age: " + str(profile['age']) + "\n"
+        if profile.get('weight_lbs'):    profile_ctx += "- Weight: " + str(profile['weight_lbs']) + " lbs\n"
+        if profile.get('location'):      profile_ctx += "- Location: " + str(profile['location']) + "\n"
+        if profile.get('fitness_level'): profile_ctx += "- Fitness: " + str(profile['fitness_level']) + "\n"
+        if profile.get('ftp'):           profile_ctx += "- FTP: " + str(profile['ftp']) + "W\n"
+        if profile.get('annual_goal_mi'):profile_ctx += "- Annual goal: " + str(profile['annual_goal_mi']) + " mi\n"
+        if profile.get('other_goals'):   profile_ctx += "- Goals: " + str(profile['other_goals']) + "\n"
+        if profile.get('health_notes'):  profile_ctx += "- Health: " + str(profile['health_notes']) + "\n"
+        if profile.get('injuries'):      profile_ctx += "- Injuries: " + str(profile['injuries']) + "\n"
+        if profile.get('heat_tolerance'):profile_ctx += "- Heat tolerance: " + str(profile['heat_tolerance']) + "\n"
+    if notes:
+        profile_ctx += "\nPERSONAL NOTES: " + "; ".join(notes) + "\n"
 
     try:
         hist = _json.loads(history)
     except:
         hist = []
 
-    system_prompt = """You are a friendly cycling coach conducting an intake interview with a new athlete.
+    system_prompt = """You are a friendly cycling coach conducting an ongoing coaching conversation with an athlete.
 Your goal is to gather key information naturally through conversation:
 - Age and weight
 - Where they ride (city/region/climate — heat, altitude, terrain)
@@ -762,7 +779,7 @@ IMPORTANT RULES:
 - If they mention recent COVID, flu, mono, or similar illness: briefly note the post-viral performance dip and adjust expectations.
 - Keep responses conversational, warm, 2-4 sentences max.
 - After gathering enough info (3-4 exchanges), summarize what you've learned and ask if there's anything else important to share.
-- End by saying their profile has been saved and coaching will be personalized to them.
+- End by saying their profile has been saved and coaching will be personalized to them." + profile_ctx + "
 
 At the END of your response, on a new line, output a JSON object (and ONLY the JSON, no other text on that line) with any profile fields you extracted:
 {"age":null,"weight_lbs":null,"location":null,"fitness_level":null,"ftp":null,"annual_goal_mi":null,"other_goals":null,"health_notes":null,"injuries":null,"heat_tolerance":null,"medical_clearance":false}
