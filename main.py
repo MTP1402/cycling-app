@@ -285,9 +285,48 @@ def build_full_dashboard(rides, name, annual_goal=None):
     js_mo_hr = "barChart('monthlyHours'," + j(mo_names) + ",[{label:'Hours',data:" + j(month_hours) + ",backgroundColor:PURPLE+'CC'}]);"
     js_rt_mi = "barChart('rtypeMiles'," + j(all_types) + ",[{label:'Miles',data:" + j(rtype_mi_vals) + ",backgroundColor:TYPE_COLORS.map(c=>c+'CC')}],{indexAxis:'y'});"
     js_rt_hr = "barChart('rtypeHours'," + j(all_types) + ",[{label:'Hours',data:" + j(rtype_hrs_vals) + ",backgroundColor:TYPE_COLORS.map(c=>c+'CC')}],{indexAxis:'y'});"
-    js_virt  = ("barChart('virtualBar',['Miles','Hours'],"
-                "[{label:'Virtual',data:[" + str(virt_mi) + "," + str(virt_hrs) + "],backgroundColor:PURPLE+'CC'},"
-                "{label:'Outdoor',data:[" + str(out_mi)  + "," + str(out_hrs)  + "],backgroundColor:GREEN+'CC'}]);")
+    # Virtual vs outdoor — custom HTML dual-axis chart
+    max_mi = max(out_mi + virt_mi, 1)
+    max_hr = max(out_hrs + virt_hrs, 1)
+    pct_om = round(out_mi / max_mi * 100, 1)
+    pct_vm = max(round(virt_mi / max_mi * 100, 1), 2)
+    pct_oh = round(out_hrs / max_hr * 100, 1)
+    pct_vh = max(round(virt_hrs / max_hr * 100, 1), 2)
+    virt_html = (
+        "<div style=\"font-size:11px;color:#555;margin-bottom:8px;\">" 
+        "<span style=\"display:inline-flex;align-items:center;gap:4px;margin-right:12px;\">" 
+        "<span style=\"width:10px;height:10px;border-radius:2px;background:#27AE60;display:inline-block;\"></span>Outdoor</span>" 
+        "<span style=\"display:inline-flex;align-items:center;gap:4px;\">" 
+        "<span style=\"width:10px;height:10px;border-radius:2px;background:#9B59B6;display:inline-block;\"></span>Virtual</span></div>" 
+        "<div style=\"font-size:10px;color:#999;display:flex;justify-content:space-between;padding-left:84px;margin-bottom:2px;\">" 
+        "<span>0</span><span>" + str(round(max_mi/2)) + "</span>" 
+        "<span style=\"color:#1F4E79;font-weight:600;\">Miles</span>" 
+        "<span>" + str(round(max_mi)) + "</span></div>" 
+        "<div style=\"border-left:1.5px solid #ccc;margin-left:84px;padding:2px 0;\">" 
+        "<div style=\"display:flex;align-items:center;position:relative;height:26px;margin-bottom:5px;\">" 
+        "<span style=\"position:absolute;left:-88px;font-size:11px;color:#555;width:84px;text-align:right;padding-right:6px;\">Outdoor mi</span>" 
+        "<div style=\"height:22px;width:" + str(pct_om) + "%;background:#27AE60CC;border-radius:0 4px 4px 0;display:flex;align-items:center;padding:0 8px;\">" 
+        "<span style=\"font-size:11px;font-weight:600;color:#fff;\">" + str(out_mi) + "</span></div></div>" 
+        "<div style=\"display:flex;align-items:center;position:relative;height:26px;margin-bottom:5px;\">" 
+        "<span style=\"position:absolute;left:-88px;font-size:11px;color:#555;width:84px;text-align:right;padding-right:6px;\">Virtual mi</span>" 
+        "<div style=\"height:22px;width:" + str(pct_vm) + "%;background:#9B59B6CC;border-radius:0 4px 4px 0;display:flex;align-items:center;padding:0 8px;min-width:38px;\">" 
+        "<span style=\"font-size:11px;font-weight:600;color:#fff;\">" + str(virt_mi) + "</span></div></div></div>" 
+        "<div style=\"height:10px;\"></div>" 
+        "<div style=\"font-size:10px;color:#999;display:flex;justify-content:space-between;padding-left:84px;margin-bottom:2px;\">" 
+        "<span>0</span><span>" + str(round(max_hr/2)) + "</span>" 
+        "<span style=\"color:#1F4E79;font-weight:600;\">Hours</span>" 
+        "<span>" + str(round(max_hr)) + "</span></div>" 
+        "<div style=\"border-left:1.5px solid #ccc;margin-left:84px;padding:2px 0;\">" 
+        "<div style=\"display:flex;align-items:center;position:relative;height:26px;margin-bottom:5px;\">" 
+        "<span style=\"position:absolute;left:-88px;font-size:11px;color:#555;width:84px;text-align:right;padding-right:6px;\">Outdoor hr</span>" 
+        "<div style=\"height:22px;width:" + str(pct_oh) + "%;background:#27AE60CC;border-radius:0 4px 4px 0;display:flex;align-items:center;padding:0 8px;\">" 
+        "<span style=\"font-size:11px;font-weight:600;color:#fff;\">" + str(out_hrs) + "</span></div></div>" 
+        "<div style=\"display:flex;align-items:center;position:relative;height:26px;\">" 
+        "<span style=\"position:absolute;left:-88px;font-size:11px;color:#555;width:84px;text-align:right;padding-right:6px;\">Virtual hr</span>" 
+        "<div style=\"height:22px;width:" + str(pct_vh) + "%;background:#9B59B6CC;border-radius:0 4px 4px 0;display:flex;align-items:center;padding:0 8px;min-width:36px;\">" 
+        "<span style=\"font-size:11px;font-weight:600;color:#fff;\">" + str(virt_hrs) + "</span></div></div></div>"
+    )
+    js_virt = "document.getElementById('virtualCustom').innerHTML=" + repr(virt_html) + ";"
     js_elev  = "barChart('elevBar'," + j(ride_dates) + ",[{label:'Elev Gain (ft)',data:" + j(ride_elev) + ",backgroundColor:ORANGE+'CC'}]);"
     js_pwr   = "lineChart('powerLine'," + j(ride_dates) + ",[{label:'Avg Power (W)',data:" + j(ride_power) + ",borderColor:RED,backgroundColor:RED+'20',fill:false,spanGaps:true}]);"
     js_hr    = "lineChart('hrLine'," + j(ride_dates) + ",[{label:'Avg HR (bpm)',data:" + j(ride_hr) + ",borderColor:'#E91E63',backgroundColor:'#E91E6320',fill:false,spanGaps:true}]);"
