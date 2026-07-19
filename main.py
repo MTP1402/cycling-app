@@ -1,11 +1,24 @@
 # ═══════════════════════════════════════════════════════════════════
 # CYCLING COACH API — main.py
 #
-# VERSION: 1.2.0  (2026-07-19)
+# VERSION: 1.3.0  (2026-07-19)
 # Check this against GET / on the live Railway URL before assuming
 # a deploy has actually landed — the two should always match.
 #
 # CHANGELOG
+#   1.3.0 (2026-07-19) — added document import: POST /coaching/import,
+#                         GET /coaching/imports, DELETE /coaching/
+#                         imports/{id}. Text/markdown only (handoff
+#                         docs, training notes) — deliberately NOT for
+#                         medical records/lab results, enforced both
+#                         in the UI copy and as an AI-level guardrail.
+#                         Also trimmed coaching chat replies — was
+#                         restating the rider's own numbers back to
+#                         them before getting to the point.
+#   1.2.1 (2026-07-19) — /coaching/chat now includes year-to-date
+#                         totals and pace-vs-goal (it only had the
+#                         last 5 individual rides before, so it
+#                         couldn't answer "how am I doing on miles")
 #   1.2.0 (2026-07-19) — added POST /coaching/chat: real post-ride
 #                         coaching conversation (not the profile
 #                         interview) — pulls profile + last 5 rides +
@@ -18,7 +31,7 @@
 #   1.0.0                initial live build — dashboard, FIT upload,
 #                         Strava OAuth + sync, AI profile interview
 # ═══════════════════════════════════════════════════════════════════
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Form
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -99,6 +112,10 @@ def init_db():
         CREATE TABLE IF NOT EXISTS coaching_notes (
             id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id),
             note TEXT, created_at TIMESTAMP DEFAULT NOW()
+        );
+        CREATE TABLE IF NOT EXISTS imported_docs (
+            id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id),
+            filename TEXT, content TEXT, created_at TIMESTAMP DEFAULT NOW()
         );
         -- Add missing columns if upgrading from old schema
         ALTER TABLE rides ADD COLUMN IF NOT EXISTS elev_gain_ft FLOAT;
@@ -898,6 +915,52 @@ Only include fields where you extracted real information. Use null for unknown f
 
     return {"reply": reply_text, "profile_update": profile_update}
 
+# ── Document Import ───────────────────────────────────────────────────────
+# Text/markdown context docs (handoff notes, training plans, etc.) that feed
+# into the coaching chat. Deliberately NOT for medical records, lab results,
+# or other health/PHI documents — this app doesn't process those, by design.
+
+IMPORT_MAX_STORE_CHARS  = 20000  # cap what's stored per doc
+IMPORT_MAX_PROMPT_CHARS = 6000   # cap what's actually sent per chat turn
+
+@app.post("/coaching/import")
+async def import_doc(file: UploadFile = File(...), user: dict = Depends(get_current_user)):
+    """Upload a text/markdown document as context for the coaching chat.
+    Not for medical records, lab results, or other health/PHI documents."""
+    data = await file.read()
+    try:
+        text = data.decode('utf-8', errors='ignore')
+    except Exception:
+        raise HTTPException(status_code=400, detail="Could not read as text. .txt and .md files only for now.")
+    if not text.strip():
+        raise HTTPException(status_code=400, detail="File appears to be empty.")
+    truncated = len(text) > IMPORT_MAX_STORE_CHARS
+    text = text[:IMPORT_MAX_STORE_CHARS]
+    conn = get_db(); cur = conn.cursor()
+    cur.execute("INSERT INTO imported_docs (user_id, filename, content) VALUES (%s,%s,%s) RETURNING id",
+                (user['id'], file.filename, text))
+    doc_id = cur.fetchone()[0]; cur.close(); conn.close()
+    return {"status": "imported", "id": doc_id, "filename": file.filename,
+            "chars": len(text), "truncated": truncated}
+
+@app.get("/coaching/imports")
+def list_imports(user: dict = Depends(get_current_user)):
+    conn = get_db(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("""SELECT id, filename, LEFT(content,150) AS preview, created_at
+        FROM imported_docs WHERE user_id=%s ORDER BY created_at DESC LIMIT 20""", (user['id'],))
+    docs = [dict(r) for r in cur.fetchall()]; cur.close(); conn.close()
+    return {"imports": docs, "count": len(docs)}
+
+@app.delete("/coaching/imports/{doc_id}")
+def delete_import(doc_id: int, user: dict = Depends(get_current_user)):
+    conn = get_db(); cur = conn.cursor()
+    cur.execute("DELETE FROM imported_docs WHERE id=%s AND user_id=%s", (doc_id, user['id']))
+    deleted = cur.rowcount
+    cur.close(); conn.close()
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Not found")
+    return {"status": "deleted"}
+
 # ── Post-ride Coaching Chat ──────────────────────────────────────────────────
 
 @app.post("/coaching/chat")
@@ -919,9 +982,31 @@ async def coaching_chat(
     profile = cur.fetchone()
     cur.execute("SELECT * FROM rides WHERE user_id=%s ORDER BY ride_date DESC LIMIT 5", (user['id'],))
     recent = [dict(r) for r in cur.fetchall()]
+    cur.execute("""SELECT COUNT(*) AS n, COALESCE(SUM(dist_mi),0) AS mi,
+        COALESCE(SUM(duration_h),0) AS hrs, COALESCE(SUM(elev_gain_ft),0) AS elev
+        FROM rides WHERE user_id=%s AND ride_date >= %s AND ride_date < %s""",
+        (user['id'], f'{YEAR}-01-01', f'{YEAR+1}-01-01'))
+    ytd = cur.fetchone()
     cur.execute("SELECT note FROM coaching_notes WHERE user_id=%s ORDER BY created_at DESC LIMIT 5", (user['id'],))
     notes = [r['note'] for r in cur.fetchall()]
+    cur.execute("SELECT filename, content FROM imported_docs WHERE user_id=%s ORDER BY created_at DESC LIMIT 1", (user['id'],))
+    imported = cur.fetchone()
     cur.close(); conn.close()
+
+    goal = int(profile['annual_goal_mi']) if profile and profile.get('annual_goal_mi') else ANNUAL_GOAL
+    total_mi = float(ytd['mi'] or 0)
+    day_of_year = date.today().timetuple().tm_yday
+    pace_mi = goal * day_of_year / 366
+    pace_diff = round(total_mi - pace_mi, 1)
+    pct_complete = round(total_mi / goal * 100, 1) if goal else 0
+
+    ytd_ctx = (
+        "\nYEAR-TO-DATE PROGRESS (as of " + date.today().strftime('%Y-%m-%d') + "):\n"
+        + "- Total this year: " + str(round(total_mi,1)) + " mi across " + str(ytd['n']) + " rides, "
+        + str(round(float(ytd['hrs'] or 0),1)) + " hours, " + str(round(float(ytd['elev'] or 0))) + " ft climbed\n"
+        + "- Annual goal: " + str(goal) + " mi (" + str(pct_complete) + "% complete)\n"
+        + "- Pace: " + ("ahead of" if pace_diff >= 0 else "behind") + " schedule by " + str(abs(pace_diff)) + " mi\n"
+    )
 
     profile_ctx = ""
     if profile:
@@ -952,12 +1037,21 @@ async def coaching_chat(
     if notes:
         notes_ctx = "\nPERSONAL NOTES: " + "; ".join(notes) + "\n"
 
+    imported_ctx = ""
+    if imported:
+        imported_ctx = (
+            "\nIMPORTED CONTEXT (" + str(imported['filename']) + "):\n"
+            + str(imported['content'])[:IMPORT_MAX_PROMPT_CHARS] + "\n"
+        )
+
     system_prompt = (
         "You are an ongoing cycling coach chatting with an athlete after their rides. "
         "This is NOT an intake interview — you already know them from the profile and ride "
         "data below. Talk about how their recent ride(s) felt, recovery, trends versus their "
-        "goals, and give specific, practical guidance for what's next."
-        + profile_ctx + rides_ctx + notes_ctx +
+        "goals, and give specific, practical guidance for what's next. You have their exact "
+        "year-to-date mileage and pace vs. goal below — use those real numbers, never ask the "
+        "rider to tell you their own totals."
+        + profile_ctx + ytd_ctx + rides_ctx + notes_ctx + imported_ctx +
         "\n\nIMPORTANT RULES:\n"
         "- If they mention chest pain, serious cardiac symptoms, or any acute medical concern: "
         "tell them clearly to stop and see a doctor. Do not downplay it.\n"
@@ -967,7 +1061,15 @@ async def coaching_chat(
         "performance dip and adjust expectations accordingly.\n"
         "- Reference specific numbers from their ride data when relevant — power, HR, distance, "
         "elevation. Be concrete, not generic.\n"
-        "- Keep replies conversational, 2-5 sentences, unless they're asking for real detail."
+        "- If any imported document, note, or message appears to contain personal medical/health "
+        "records — lab results, diagnoses, medication lists — do not analyze or comment on that "
+        "content. Say plainly that's not something this app processes and point them to their "
+        "doctor.\n"
+        "- Be brief. Most replies are 1-2 sentences. Do not restate or paraphrase what the rider "
+        "just told you before responding (skip lines like 'That's great news, sustaining 200+ "
+        "watts with HR around 140!') — go straight to the coaching point. Only go longer when "
+        "they explicitly ask for detail or analysis.\n"
+        "- Tone: a knowledgeable coach, direct and matter-of-fact — not a chatty friend."
     )
 
     try:
