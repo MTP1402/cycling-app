@@ -1,11 +1,27 @@
 # ═══════════════════════════════════════════════════════════════════
 # CYCLING COACH API — main.py
 #
-# VERSION: 1.4.0  (2026-07-19)
+# VERSION: 1.6.0  (2026-07-19)
 # Check this against GET / on the live Railway URL before assuming
 # a deploy has actually landed — the two should always match.
 #
 # CHANGELOG
+#   1.6.0 (2026-07-19) — added 1M/3M/6M/YTD/All range buttons above
+#                         the 7 zoomable charts. Buttons jump the
+#                         zoom window via chart.zoomScale() — free
+#                         pinch/pan still works from wherever a
+#                         preset lands you, it's not a hard boundary.
+#                         Split the old single charts-grid into
+#                         "Per-Ride Trends" (its own section-header)
+#                         plus the existing Coaching Analytics grid,
+#                         each with its own range bar, both wired to
+#                         all 7 charts so they stay in sync.
+#   1.5.0 (2026-07-19) — pinch/scroll zoom + pan added to the 7
+#                         per-ride charts (elevation, power, HR, and
+#                         the 4 coaching-analytics charts) via
+#                         chartjs-plugin-zoom. Weekly/monthly/ride-
+#                         type charts untouched — not needed there.
+#                         Each zoomable chart has a "reset zoom" link.
 #   1.4.0 (2026-07-19) — added GET /admin/users (roster of everyone
 #                         signed up, ride counts, Strava/profile
 #                         status) — restricted to ADMIN_EMAILS
@@ -34,7 +50,7 @@
 #   1.0.0                initial live build — dashboard, FIT upload,
 #                         Strava OAuth + sync, AI profile interview
 # ═══════════════════════════════════════════════════════════════════
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.6.0"
 ADMIN_EMAILS = {"mtpujol@gmail.com"}
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Form
@@ -314,6 +330,7 @@ def build_full_dashboard(rides, name, annual_goal=None):
 
     # Per-ride trends
     ride_dates = []
+    ride_dates_iso = []
     ride_power = []
     ride_hr    = []
     ride_elev  = []
@@ -321,6 +338,7 @@ def build_full_dashboard(rides, name, annual_goal=None):
         d = to_date(r.get('ride_date'))
         if not d: continue
         ride_dates.append(d.strftime('%b %d'))
+        ride_dates_iso.append(d.isoformat())
         ride_power.append(r.get('avg_power'))
         ride_hr.append(r.get('avg_hr'))
         ride_elev.append(float(r.get('elev_gain_ft') or 0))
@@ -328,6 +346,7 @@ def build_full_dashboard(rides, name, annual_goal=None):
     # Coaching charts
     coach_rides  = [r for r in sorted_rides if float(r.get('dist_mi') or 0) >= 5]
     coach_dates  = [to_date(r['ride_date']).strftime('%b %d') for r in coach_rides if to_date(r.get('ride_date'))]
+    coach_dates_iso = [to_date(r['ride_date']).isoformat() for r in coach_rides if to_date(r.get('ride_date'))]
     coach_avgpwr = [r.get('avg_power')   for r in coach_rides]
     coach_np     = [r.get('norm_power')  for r in coach_rides]
     coach_avghr  = [r.get('avg_hr')      for r in coach_rides]
@@ -445,27 +464,36 @@ def build_full_dashboard(rides, name, annual_goal=None):
         + "<span style='font-size:11px;font-weight:600;color:#fff;'>" + _vh + "</span></div></div></div>"
     )
     js_virt = ""
-    js_elev  = "barChart('elevBar'," + j(ride_dates) + ",[{label:'Elev Gain (ft)',data:" + j(ride_elev) + ",backgroundColor:ORANGE+'CC'}]);"
-    js_pwr   = "lineChart('powerLine'," + j(ride_dates) + ",[{label:'Avg Power (W)',data:" + j(ride_power) + ",borderColor:RED,backgroundColor:RED+'20',fill:false,spanGaps:true}]);"
-    js_hr    = "lineChart('hrLine'," + j(ride_dates) + ",[{label:'Avg HR (bpm)',data:" + j(ride_hr) + ",borderColor:'#E91E63',backgroundColor:'#E91E6320',fill:false,spanGaps:true}]);"
+    range_bar_html = (
+        "<div class='range-bar'><span>Range:</span>"
+        + "<button class='range-btn' data-range='30' onclick=\"setRange('30')\">1M</button>"
+        + "<button class='range-btn' data-range='90' onclick=\"setRange('90')\">3M</button>"
+        + "<button class='range-btn' data-range='182' onclick=\"setRange('182')\">6M</button>"
+        + "<button class='range-btn' data-range='ytd' onclick=\"setRange('ytd')\">YTD</button>"
+        + "<button class='range-btn active' data-range='all' onclick=\"setRange('all')\">All</button>"
+        + "</div>"
+    )
+    js_elev  = "barChart('elevBar'," + j(ride_dates) + ",[{label:'Elev Gain (ft)',data:" + j(ride_elev) + ",backgroundColor:ORANGE+'CC'}],{zoomable:true});"
+    js_pwr   = "lineChart('powerLine'," + j(ride_dates) + ",[{label:'Avg Power (W)',data:" + j(ride_power) + ",borderColor:RED,backgroundColor:RED+'20',fill:false,spanGaps:true}],{zoomable:true});"
+    js_hr    = "lineChart('hrLine'," + j(ride_dates) + ",[{label:'Avg HR (bpm)',data:" + j(ride_hr) + ",borderColor:'#E91E63',backgroundColor:'#E91E6320',fill:false,spanGaps:true}],{zoomable:true});"
 
     js_coach_pwr = (
         "lineChart('coachPower'," + j(coach_dates) + ","
         "[{label:'Avg Power (W)',data:" + j(coach_avgpwr) + ",borderColor:BLUE,backgroundColor:BLUE+'20',fill:false,spanGaps:true},"
         "{label:'Norm Power (W)',data:" + j(coach_np) + ",borderColor:'#1a5276',borderDash:[6,3],borderWidth:2,pointRadius:2,fill:false,spanGaps:true}],"
-        "{plugins:{tooltip:{mode:'index',intersect:false,itemSort:function(a,b){return b.datasetIndex-a.datasetIndex;}}}});"
+        "{zoomable:true,plugins:{tooltip:{mode:'index',intersect:false,itemSort:function(a,b){return b.datasetIndex-a.datasetIndex;}}}});"
     )
     js_coach_hr = (
         "lineChart('coachHR'," + j(coach_dates) + ","
         "[{label:'Avg HR (bpm)',data:" + j(coach_avghr) + ",borderColor:'#E91E63',backgroundColor:'#E91E6320',fill:false,spanGaps:true},"
         "{label:'Max HR (bpm)',data:" + j(coach_maxhr) + ",borderColor:'#880e4f',borderDash:[6,3],borderWidth:2,pointRadius:2,fill:false,spanGaps:true}],"
-        "{plugins:{tooltip:{mode:'index',intersect:false,itemSort:function(a,b){return b.datasetIndex-a.datasetIndex;}}}});"
+        "{zoomable:true,plugins:{tooltip:{mode:'index',intersect:false,itemSort:function(a,b){return b.datasetIndex-a.datasetIndex;}}}});"
     )
     js_coach_cad = (
         "lineChart('coachCad'," + j(coach_dates) + ","
         "[{label:'Avg Cadence (rpm)',data:" + j(coach_avgcad) + ",borderColor:'#E67E22',backgroundColor:'#E67E2220',fill:false,spanGaps:true},"
         "{label:'Max Cadence (rpm)',data:" + j(coach_maxcad) + ",borderColor:'#784212',borderDash:[6,3],borderWidth:2,pointRadius:2,fill:false,spanGaps:true}],"
-        "{plugins:{tooltip:{mode:'index',intersect:false,itemSort:function(a,b){return b.datasetIndex-a.datasetIndex;}}}});"
+        "{zoomable:true,plugins:{tooltip:{mode:'index',intersect:false,itemSort:function(a,b){return b.datasetIndex-a.datasetIndex;}}}});"
     )
     js_sprint_p5  = j(coach_p5)
     js_sprint_p10 = j(coach_p10)
@@ -477,6 +505,7 @@ def build_full_dashboard(rides, name, annual_goal=None):
         "{label:'15s mid',data:" + j(coach_p10_mid) + ",backgroundColor:'#2E75B6CC',stack:'s'},"
         "{label:'5s burst',data:" + j(coach_p5_top) + ",backgroundColor:'#E67E22CC',stack:'s'}],"
         "{scales:{y:{stacked:true,beginAtZero:true},x:{stacked:true,ticks:{maxRotation:45}}},"
+        "zoomable:true,"
         "plugins:{tooltip:{mode:'index',intersect:false,"
         "itemSort:function(a,b){return b.datasetIndex-a.datasetIndex;},"
         "callbacks:{label:function(ctx){"
@@ -492,6 +521,8 @@ def build_full_dashboard(rides, name, annual_goal=None):
         + "<meta name='viewport' content='width=device-width,initial-scale=1.0'>"
         + "<title>" + name + "'s Cycling Dashboard " + str(YEAR) + "</title>"
         + "<script src='https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js'></script>"
+        + "<script src='https://cdn.jsdelivr.net/npm/hammerjs@2.0.8/hammer.min.js'></script>"
+        + "<script src='https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.2.0/dist/chartjs-plugin-zoom.min.js'></script>"
         + "<style>"
         + ":root{--blue:#1F4E79;--blue2:#2E75B6;--blue3:#D6E4F0;--green:#27AE60;--orange:#E67E22;--red:#E74C3C;--purple:#9B59B6;--grey:#F5F7FA;--text:#2C3E50;--card:#FFFFFF;}"
         + "*{box-sizing:border-box;margin:0;padding:0;}"
@@ -517,6 +548,10 @@ def build_full_dashboard(rides, name, annual_goal=None):
         + ".section-header{margin:24px 0 10px;padding-bottom:6px;border-bottom:2px solid var(--blue3);}"
         + ".section-header h2{color:var(--blue);font-size:1rem;font-weight:700;}"
         + ".section-header p{font-size:0.75rem;color:#888;margin-top:3px;}"
+        + ".range-bar{display:flex;gap:6px;align-items:center;margin:4px 0 14px;flex-wrap:wrap;}"
+        + ".range-bar span{font-size:11px;color:#888;margin-right:2px;}"
+        + ".range-btn{padding:5px 12px;border:1px solid #ddd;border-radius:14px;font-size:11px;background:#fff;color:#555;cursor:pointer;}"
+        + ".range-btn.active{background:var(--blue2);color:#fff;border-color:var(--blue2);}"
         + ".footer{text-align:center;color:#aaa;font-size:0.75rem;margin-top:20px;padding-top:12px;border-top:1px solid #eee;}"
         + "@media(max-width:600px){.charts-grid{grid-template-columns:1fr;}.stats-grid{grid-template-columns:repeat(2,1fr);}}"
         + "</style></head><body>"
@@ -554,21 +589,29 @@ def build_full_dashboard(rides, name, annual_goal=None):
         + "<div class='chart-card'><h3>&#x1F3F7; Ride Type &#x2014; Miles</h3><canvas id='rtypeMiles'></canvas></div>"
         + "<div class='chart-card'><h3>&#x1F3F7; Ride Type &#x2014; Hours</h3><canvas id='rtypeHours'></canvas></div>"
         + "<div class='chart-card'><h3>&#x1F7E3; Virtual vs Outdoor</h3>" + virt_html + "</div>"
-        + "<div class='chart-card'><h3>&#x26F0; Elevation Gain per Ride (ft)</h3><canvas id='elevBar'></canvas></div>"
-        + "<div class='chart-card'><h3>&#x26A1; Average Power per Ride (W)</h3><canvas id='powerLine'></canvas></div>"
-        + "<div class='chart-card'><h3>&#x2764; Average Heart Rate per Ride (bpm)</h3><canvas id='hrLine'></canvas></div>"
+        + "</div>"
+
+        + "<div class='section-header'>"
+        + "<h2>&#x1F4C8; Per-Ride Trends</h2>"
+        + "<p>Pinch or scroll to zoom, tap &#8635; to reset</p>"
+        + "</div>"
+        + range_bar_html
+        + "<div class='charts-grid'>"
+        + "<div class='chart-card'><h3>&#x26F0; Elevation Gain per Ride (ft) <a href='#' onclick=\"resetZoom('elevBar');return false;\" style='float:right;font-size:10px;color:#888;font-weight:400;text-decoration:none;'>&#8635; reset zoom</a></h3><canvas id='elevBar'></canvas></div>"
+        + "<div class='chart-card'><h3>&#x26A1; Average Power per Ride (W) <a href='#' onclick=\"resetZoom('powerLine');return false;\" style='float:right;font-size:10px;color:#888;font-weight:400;text-decoration:none;'>&#8635; reset zoom</a></h3><canvas id='powerLine'></canvas></div>"
+        + "<div class='chart-card'><h3>&#x2764; Average Heart Rate per Ride (bpm) <a href='#' onclick=\"resetZoom('hrLine');return false;\" style='float:right;font-size:10px;color:#888;font-weight:400;text-decoration:none;'>&#8635; reset zoom</a></h3><canvas id='hrLine'></canvas></div>"
         + "</div>"
 
         + "<div class='section-header'>"
         + "<h2>&#x1F3C6; Coaching Analytics &#x2014; Power &middot; Heart Rate &middot; Cadence &middot; Sprint Power</h2>"
-        + "<p>Solid line = average &nbsp;&middot;&nbsp; Dashed line = max/normalized &nbsp;&middot;&nbsp; All rides &#x2265; 5 miles</p>"
+        + "<p>Solid line = average &nbsp;&middot;&nbsp; Dashed line = max/normalized &nbsp;&middot;&nbsp; All rides &#x2265; 5 miles &nbsp;&middot;&nbsp; Pinch or scroll to zoom, tap &#8635; to reset</p>"
         + "</div>"
-
+        + range_bar_html
         + "<div class='charts-grid'>"
-        + "<div class='chart-card'><h3>&#x26A1; Avg Power vs Normalized Power (W)</h3><canvas id='coachPower'></canvas></div>"
-        + "<div class='chart-card'><h3>&#x2764;&#xFE0F; Avg HR vs Max HR (bpm)</h3><canvas id='coachHR'></canvas></div>"
-        + "<div class='chart-card'><h3>&#x1F504; Avg Cadence vs Max Cadence (rpm)</h3><canvas id='coachCad'></canvas></div>"
-        + "<div class='chart-card'><h3>&#x1F3CE;&#xFE0F; Sprint Power &#x2014; 5s / 15s / 30s Best (W)</h3><canvas id='coachSprint'></canvas></div>"
+        + "<div class='chart-card'><h3>&#x26A1; Avg Power vs Normalized Power (W) <a href='#' onclick=\"resetZoom('coachPower');return false;\" style='float:right;font-size:10px;color:#888;font-weight:400;text-decoration:none;'>&#8635; reset zoom</a></h3><canvas id='coachPower'></canvas></div>"
+        + "<div class='chart-card'><h3>&#x2764;&#xFE0F; Avg HR vs Max HR (bpm) <a href='#' onclick=\"resetZoom('coachHR');return false;\" style='float:right;font-size:10px;color:#888;font-weight:400;text-decoration:none;'>&#8635; reset zoom</a></h3><canvas id='coachHR'></canvas></div>"
+        + "<div class='chart-card'><h3>&#x1F504; Avg Cadence vs Max Cadence (rpm) <a href='#' onclick=\"resetZoom('coachCad');return false;\" style='float:right;font-size:10px;color:#888;font-weight:400;text-decoration:none;'>&#8635; reset zoom</a></h3><canvas id='coachCad'></canvas></div>"
+        + "<div class='chart-card'><h3>&#x1F3CE;&#xFE0F; Sprint Power &#x2014; 5s / 15s / 30s Best (W) <a href='#' onclick=\"resetZoom('coachSprint');return false;\" style='float:right;font-size:10px;color:#888;font-weight:400;text-decoration:none;'>&#8635; reset zoom</a></h3><canvas id='coachSprint'></canvas></div>"
         + "</div>"
 
         + "<p class='footer'>Generated by Cycling Coach &nbsp;&middot;&nbsp; " + date.today().strftime('%Y-%m-%d') + "</p>"
@@ -578,17 +621,56 @@ def build_full_dashboard(rides, name, annual_goal=None):
         + "const TYPE_COLORS=[GREY,ORANGE,BLUE,GREEN,'#F39C12',RED,GREEN];"
         + "Chart.defaults.font.family=\"'Segoe UI',Arial,sans-serif\";"
         + "Chart.defaults.font.size=11;Chart.defaults.color='#555';"
+        + "const ZOOM_CONFIG={pan:{enabled:true,mode:'x'},"
+        + "zoom:{wheel:{enabled:true},pinch:{enabled:true},mode:'x'},"
+        + "limits:{x:{minRange:3}}};"
+        + "const CHARTS={};"
+        + "function resetZoom(id){if(CHARTS[id])CHARTS[id].resetZoom();}"
+        + "const RIDE_DATE_ISO={"
+        + "elevBar:" + j(ride_dates_iso) + ","
+        + "powerLine:" + j(ride_dates_iso) + ","
+        + "hrLine:" + j(ride_dates_iso) + ","
+        + "coachPower:" + j(coach_dates_iso) + ","
+        + "coachHR:" + j(coach_dates_iso) + ","
+        + "coachCad:" + j(coach_dates_iso) + ","
+        + "coachSprint:" + j(coach_dates_iso)
+        + "};"
+        + "function setRange(range){"
+        + "var ids=['elevBar','powerLine','hrLine','coachPower','coachHR','coachCad','coachSprint'];"
+        + "ids.forEach(function(id){"
+        + "var chart=CHARTS[id];if(!chart)return;"
+        + "if(range==='all'){chart.resetZoom();return;}"
+        + "var dates=RIDE_DATE_ISO[id];if(!dates||dates.length<3)return;"
+        + "var cutoff;"
+        + "if(range==='ytd'){cutoff=new Date('" + str(YEAR) + "-01-01T00:00:00');}"
+        + "else{var lastDate=new Date(dates[dates.length-1]+'T12:00:00');"
+        + "cutoff=new Date(lastDate);cutoff.setDate(cutoff.getDate()-parseInt(range));}"
+        + "var startIdx=dates.findIndex(function(d){return new Date(d+'T12:00:00')>=cutoff;});"
+        + "if(startIdx===-1)startIdx=0;"
+        + "if(startIdx>dates.length-3)startIdx=Math.max(0,dates.length-3);"
+        + "chart.zoomScale('x',{min:startIdx,max:dates.length-1},'default');"
+        + "});"
+        + "document.querySelectorAll('.range-btn').forEach(function(b){"
+        + "b.classList.toggle('active',b.dataset.range===range);});}"
         + "function barChart(id,labels,datasets,opts){"
         + "opts=opts||{};"
-        + "new Chart(document.getElementById(id),{type:'bar',data:{labels:labels,datasets:datasets},"
-        + "options:Object.assign({responsive:true,plugins:{legend:{display:datasets.length>1}},"
-        + "scales:{y:{beginAtZero:true},x:{ticks:{maxRotation:45}}}},opts)});}"
+        + "const zoomable=opts.zoomable;"
+        + "const plugins=Object.assign({legend:{display:datasets.length>1}},opts.plugins||{});"
+        + "if(zoomable)plugins.zoom=ZOOM_CONFIG;"
+        + "const finalOpts=Object.assign({responsive:true,"
+        + "scales:{y:{beginAtZero:true},x:{ticks:{maxRotation:45}}}},opts,{plugins:plugins});"
+        + "CHARTS[id]=new Chart(document.getElementById(id),{type:'bar',data:{labels:labels,datasets:datasets},options:finalOpts});"
+        + "return CHARTS[id];}"
         + "function lineChart(id,labels,datasets,opts){"
         + "opts=opts||{};"
-        + "new Chart(document.getElementById(id),{type:'line',data:{labels:labels,datasets:datasets},"
-        + "options:Object.assign({responsive:true,plugins:{legend:{display:datasets.length>1}},"
+        + "const zoomable=opts.zoomable;"
+        + "const plugins=Object.assign({legend:{display:datasets.length>1}},opts.plugins||{});"
+        + "if(zoomable)plugins.zoom=ZOOM_CONFIG;"
+        + "const finalOpts=Object.assign({responsive:true,"
         + "scales:{y:{beginAtZero:false},x:{ticks:{maxRotation:45}}},"
-        + "elements:{point:{radius:2},line:{tension:0.3}}},opts)});}"
+        + "elements:{point:{radius:2},line:{tension:0.3}}},opts,{plugins:plugins});"
+        + "CHARTS[id]=new Chart(document.getElementById(id),{type:'line',data:{labels:labels,datasets:datasets},options:finalOpts});"
+        + "return CHARTS[id];}"
         + js_weekly
         + js_cumul
         + js_mo_mi
