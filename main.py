@@ -444,7 +444,7 @@ def build_full_dashboard(rides, name, annual_goal=None):
     )
 
     return (
-        + "<!DOCTYPE html><html lang='en'><head>"
+        "<!DOCTYPE html><html lang='en'><head>"
         + "<meta charset='UTF-8'>"
         + "<meta name='viewport' content='width=device-width,initial-scale=1.0'>"
         + "<title>" + name + "'s Cycling Dashboard " + str(YEAR) + "</title>"
@@ -486,7 +486,7 @@ def build_full_dashboard(rides, name, annual_goal=None):
         + "<div class='value'>" + str(round(total_mi,1)) + "</div>"
         + "<div class='sub'>miles" + (" &nbsp;(" + str(pct_complete) + "% of goal)" if goal else "") + "</div></div>"
 
-        + goal_cards
+        + (goal_cards if goal_cards else "")
 
         + "<div class='stat-card'><div class='label'>Hours in Saddle</div>"
         + "<div class='value'>" + str(round(total_hrs,1)) + "</div>"
@@ -501,7 +501,7 @@ def build_full_dashboard(rides, name, annual_goal=None):
         + "<div class='sub'>feet climbed total</div></div>"
         + "</div>"
 
-        + goal_progress
+        + (goal_progress if goal_progress else "")
 
         + "<div class='charts-grid'>"
         + "<div class='chart-card'><h3>&#x1F4C5; Weekly Mileage vs " + str(WEEKLY_TARGET) + "-Mile Target</h3><canvas id='weeklyBar'></canvas></div>"
