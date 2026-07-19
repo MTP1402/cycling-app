@@ -1,3 +1,21 @@
+# ═══════════════════════════════════════════════════════════════════
+# CYCLING COACH API — main.py
+#
+# VERSION: 1.1.0  (2026-07-19)
+# Check this against GET / on the live Railway URL before assuming
+# a deploy has actually landed — the two should always match.
+#
+# CHANGELOG
+#   1.1.0 (2026-07-19) — Strava sync bounded to YEAR regardless of
+#                         days_back (fixes 2024/2025 leak); dedup
+#                         widened to +/-1 day tolerance to catch
+#                         FIT-vs-Strava date drift; added GET /notes
+#                         to verify saved personal notes actually saved
+#   1.0.0                initial live build — dashboard, FIT upload,
+#                         Strava OAuth + sync, AI profile interview
+# ═══════════════════════════════════════════════════════════════════
+APP_VERSION = "1.1.0"
+
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Form
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -630,7 +648,7 @@ def startup():
 
 @app.get("/")
 def root():
-    return {"status": "Cycling Coach API running"}
+    return {"status": "Cycling Coach API running", "version": APP_VERSION}
 
 @app.post("/register")
 def register(email: str = Form(...), name: str = Form(...), password: str = Form(...)):
@@ -661,7 +679,8 @@ async def upload_fit(file: UploadFile = File(...), notes: str = Form(default="")
     metrics = parse_fit_bytes(data)
     conn = get_db(); cur = conn.cursor()
     # Deduplication check
-    cur.execute("""SELECT id FROM rides WHERE user_id=%s AND ride_date=%s
+    cur.execute("""SELECT id FROM rides WHERE user_id=%s
+        AND ABS(ride_date - %s::date) <= 1
         AND ABS(COALESCE(dist_mi,0)-%s)<0.5 AND ABS(COALESCE(duration_h,0)-%s)<0.1""",
         (user['id'], metrics['ride_date'], metrics.get('dist_mi') or 0, metrics.get('duration_h') or 0))
     existing = cur.fetchone()
@@ -697,6 +716,14 @@ def add_note(note: str = Form(...), user: dict = Depends(get_current_user)):
     cur.execute("INSERT INTO coaching_notes (user_id,note) VALUES (%s,%s)", (user['id'],note))
     cur.close(); conn.close()
     return {"status": "saved"}
+
+@app.get("/notes")
+def get_notes(user: dict = Depends(get_current_user)):
+    """List saved personal notes, newest first — lets you verify a note actually saved."""
+    conn = get_db(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT id, note, created_at FROM coaching_notes WHERE user_id=%s ORDER BY created_at DESC LIMIT 50", (user['id'],))
+    notes = [dict(r) for r in cur.fetchall()]; cur.close(); conn.close()
+    return {"notes": notes, "count": len(notes)}
 
 @app.get("/profile")
 def get_profile(user: dict = Depends(get_current_user)):
@@ -1034,7 +1061,8 @@ async def strava_sync(
 
                     # Deduplication
                     cur3 = conn.cursor()
-                    cur3.execute("""SELECT id FROM rides WHERE user_id=%s AND ride_date=%s
+                    cur3.execute("""SELECT id FROM rides WHERE user_id=%s
+                        AND ABS(ride_date - %s::date) <= 1
                         AND ABS(COALESCE(dist_mi,0)-%s)<0.5 AND ABS(COALESCE(duration_h,0)-%s)<0.1""",
                         (user['id'], act_date, dist_mi, dur_h))
                     if cur3.fetchone():
