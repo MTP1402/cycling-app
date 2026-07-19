@@ -17,7 +17,12 @@ app = FastAPI(title="Cycling Coach API")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 DATABASE_URL  = os.environ.get("DATABASE_URL", "")
-ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+ANTHROPIC_KEY       = os.environ.get("ANTHROPIC_API_KEY", "")
+STRAVA_CLIENT_ID    = os.environ.get("STRAVA_CLIENT_ID", "266143")
+STRAVA_CLIENT_SECRET= os.environ.get("STRAVA_CLIENT_SECRET", "")
+STRAVA_REDIRECT_URI = "https://cycling-app-production.up.railway.app/strava/callback"
+STRAVA_AUTH_URL     = "https://www.strava.com/oauth/authorize"
+STRAVA_TOKEN_URL    = "https://www.strava.com/oauth/token"
 security      = HTTPBearer()
 
 ANNUAL_GOAL    = 6500
@@ -46,6 +51,16 @@ def init_db():
             elev_gain_ft FLOAT, ride_type TEXT DEFAULT 'General',
             is_virtual BOOLEAN DEFAULT FALSE, temp_c FLOAT,
             notes TEXT, created_at TIMESTAMP DEFAULT NOW()
+        );
+        CREATE TABLE IF NOT EXISTS strava_tokens (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER UNIQUE REFERENCES users(id),
+            athlete_id BIGINT,
+            access_token TEXT,
+            refresh_token TEXT,
+            expires_at BIGINT,
+            last_sync TIMESTAMP,
+            created_at TIMESTAMP DEFAULT NOW()
         );
         CREATE TABLE IF NOT EXISTS profiles (
             id SERIAL PRIMARY KEY,
@@ -838,6 +853,219 @@ Only include fields where you extracted real information. Use null for unknown f
         cur.close(); conn.close()
 
     return {"reply": reply_text, "profile_update": profile_update}
+
+# ── Strava Integration ───────────────────────────────────────────────────────
+
+@app.get("/strava/connect")
+def strava_connect(_auth: str = ""):
+    """Redirect user to Strava OAuth page. Token passed as _auth query param."""
+    from urllib.parse import urlencode
+    from fastapi.responses import RedirectResponse, HTMLResponse
+    if not _auth:
+        return HTMLResponse("<h2>Missing auth token. Please try again from the app.</h2>")
+    # Verify token
+    conn = get_db(); cur = conn.cursor()
+    cur.execute("SELECT id FROM users WHERE token=%s", (_auth,))
+    user = cur.fetchone(); cur.close(); conn.close()
+    if not user:
+        return HTMLResponse("<h2>Invalid session. Please log in again.</h2>")
+    params = {
+        "client_id":       STRAVA_CLIENT_ID,
+        "redirect_uri":    STRAVA_REDIRECT_URI,
+        "response_type":   "code",
+        "approval_prompt": "auto",
+        "scope":           "activity:read_all",
+        "state":           _auth
+    }
+    return RedirectResponse(STRAVA_AUTH_URL + "?" + urlencode(params))
+
+@app.get("/strava/callback")
+async def strava_callback(code: str, state: str, error: str = None):
+    """Handle Strava OAuth callback — exchange code for tokens."""
+    from fastapi.responses import HTMLResponse
+    if error:
+        return HTMLResponse("<h2>Strava connection cancelled.</h2><p>You can close this window.</p>")
+    
+    # Verify state is a valid user token
+    conn = get_db(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT * FROM users WHERE token=%s", (state,))
+    user = cur.fetchone()
+    if not user:
+        cur.close(); conn.close()
+        return HTMLResponse("<h2>Invalid session. Please try again.</h2>")
+
+    # Exchange code for tokens
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(STRAVA_TOKEN_URL, data={
+            "client_id":     STRAVA_CLIENT_ID,
+            "client_secret": STRAVA_CLIENT_SECRET,
+            "code":          code,
+            "grant_type":    "authorization_code"
+        })
+        data = resp.json()
+
+    if "access_token" not in data:
+        cur.close(); conn.close()
+        return HTMLResponse("<h2>Strava connection failed.</h2><p>" + str(data) + "</p>")
+
+    # Store tokens
+    cur.execute("""
+        INSERT INTO strava_tokens (user_id, athlete_id, access_token, refresh_token, expires_at)
+        VALUES (%s,%s,%s,%s,%s)
+        ON CONFLICT (user_id) DO UPDATE SET
+            athlete_id=EXCLUDED.athlete_id,
+            access_token=EXCLUDED.access_token,
+            refresh_token=EXCLUDED.refresh_token,
+            expires_at=EXCLUDED.expires_at
+    """, (user['id'], data.get('athlete',{}).get('id'),
+          data['access_token'], data['refresh_token'], data['expires_at']))
+    cur.close(); conn.close()
+
+    return HTMLResponse("""
+        <html><body style="font-family:Inter,sans-serif;text-align:center;padding:40px;">
+        <h2 style="color:#27AE60;">✓ Strava Connected!</h2>
+        <p>Your Strava account is now linked. You can close this window and return to the app.</p>
+        <script>setTimeout(()=>window.close(),3000);</script>
+        </body></html>
+    """)
+
+@app.get("/strava/status")
+def strava_status(user: dict = Depends(get_current_user)):
+    """Check if user has Strava connected."""
+    conn = get_db(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT athlete_id, last_sync FROM strava_tokens WHERE user_id=%s", (user['id'],))
+    token = cur.fetchone(); cur.close(); conn.close()
+    return {"connected": token is not None, "last_sync": str(token['last_sync']) if token and token['last_sync'] else None}
+
+@app.post("/strava/sync")
+async def strava_sync(
+    days_back: int = Form(default=90),
+    user: dict = Depends(get_current_user)
+):
+    """Pull recent activities from Strava and store them."""
+    import time
+    conn = get_db(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT * FROM strava_tokens WHERE user_id=%s", (user['id'],))
+    token_row = cur.fetchone()
+    if not token_row:
+        cur.close(); conn.close()
+        raise HTTPException(status_code=400, detail="Strava not connected")
+
+    # Refresh token if expired
+    access_token = token_row['access_token']
+    if token_row['expires_at'] and int(time.time()) > token_row['expires_at'] - 300:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(STRAVA_TOKEN_URL, data={
+                "client_id":     STRAVA_CLIENT_ID,
+                "client_secret": STRAVA_CLIENT_SECRET,
+                "grant_type":    "refresh_token",
+                "refresh_token": token_row['refresh_token']
+            })
+            new_tokens = resp.json()
+        if "access_token" in new_tokens:
+            access_token = new_tokens['access_token']
+            cur2 = conn.cursor()
+            cur2.execute("UPDATE strava_tokens SET access_token=%s, refresh_token=%s, expires_at=%s WHERE user_id=%s",
+                        (access_token, new_tokens['refresh_token'], new_tokens['expires_at'], user['id']))
+            cur2.close()
+
+    # Fetch activities
+    after_ts = int(time.time()) - (days_back * 86400)
+    imported = 0; skipped = 0; errors = 0
+    page = 1
+
+    async with httpx.AsyncClient() as client:
+        while True:
+            resp = await client.get(
+                "https://www.strava.com/api/v3/athlete/activities",
+                headers={"Authorization": "Bearer " + access_token},
+                params={"after": after_ts, "per_page": 50, "page": page}
+            )
+            activities = resp.json()
+            if not activities or not isinstance(activities, list):
+                break
+
+            for act in activities:
+                try:
+                    act_date = act.get('start_date_local','')[:10]
+                    dist_mi  = round((act.get('distance') or 0) / 1609.34, 2)
+                    dur_h    = round((act.get('moving_time') or 0) / 3600, 2)
+                    sport    = act.get('sport_type','').lower()
+                    is_virt  = act.get('trainer', False) or 'virtual' in sport or 'zwift' in (act.get('name','') or '').lower()
+
+                    # Deduplication
+                    cur3 = conn.cursor()
+                    cur3.execute("""SELECT id FROM rides WHERE user_id=%s AND ride_date=%s
+                        AND ABS(COALESCE(dist_mi,0)-%s)<0.5 AND ABS(COALESCE(duration_h,0)-%s)<0.1""",
+                        (user['id'], act_date, dist_mi, dur_h))
+                    if cur3.fetchone():
+                        cur3.close(); skipped += 1; continue
+
+                    # Get stream data for power/HR/cadence
+                    stream_resp = await client.get(
+                        f"https://www.strava.com/api/v3/activities/{act['id']}/streams",
+                        headers={"Authorization": "Bearer " + access_token},
+                        params={"keys": "watts,heartrate,cadence,altitude", "key_by_type": "true"}
+                    )
+                    streams = stream_resp.json()
+
+                    def stream_vals(key):
+                        s = streams.get(key,{})
+                        return s.get('data',[]) if isinstance(s, dict) else []
+
+                    powers   = [v for v in stream_vals('watts')     if v and v > 0]
+                    hrs      = [v for v in stream_vals('heartrate')  if v]
+                    cads     = [v for v in stream_vals('cadence')    if v]
+                    alts     = stream_vals('altitude')
+
+                    def best_avg(vals, n):
+                        if not vals or len(vals) < n: return max(vals) if vals else None
+                        return round(max(sum(vals[i:i+n])/n for i in range(len(vals)-n+1)))
+
+                    np_val = None
+                    if powers and len(powers) > 30:
+                        sm = [sum(powers[max(0,i-29):i+1])/len(powers[max(0,i-29):i+1]) for i in range(len(powers))]
+                        np_val = round((sum(x**4 for x in sm)/len(sm))**0.25)
+
+                    elev_ft = 0.0
+                    if alts and len(alts) > 1:
+                        for i in range(1, len(alts)):
+                            d = alts[i] - alts[i-1]
+                            if d > 0: elev_ft += d
+                    elev_ft = round(elev_ft * 3.28084) if elev_ft else (round((act.get('total_elevation_gain') or 0) * 3.28084))
+
+                    avg_power = round(sum(powers)/len(powers)) if powers else None
+                    avg_hr    = round(sum(hrs)/len(hrs)) if hrs else None
+                    avg_cad   = round(sum(cads)/len(cads)) if cads else None
+
+                    ride_type = classify_ride(dist_mi, dur_h, avg_power, is_virt)
+
+                    cur3.execute("""INSERT INTO rides (user_id,ride_date,name,dist_mi,duration_h,
+                        avg_power,norm_power,avg_hr,max_hr,avg_cadence,max_cadence,
+                        p5,p15,p30,elev_gain_ft,ride_type,is_virtual,temp_c,notes)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                        (user['id'], act_date, act.get('name','Activity'),
+                         dist_mi, dur_h, avg_power, np_val,
+                         avg_hr, act.get('max_heartrate'),
+                         avg_cad, max(cads) if cads else None,
+                         best_avg(powers,5), best_avg(powers,15), best_avg(powers,30),
+                         elev_ft, ride_type, is_virt,
+                         act.get('average_temp'), None))
+                    cur3.close()
+                    imported += 1
+                except Exception as e:
+                    errors += 1
+
+            if len(activities) < 50:
+                break
+            page += 1
+
+    # Update last sync time
+    cur.execute("UPDATE strava_tokens SET last_sync=NOW() WHERE user_id=%s", (user['id'],))
+    cur.close(); conn.close()
+
+    return {"imported": imported, "skipped": skipped, "errors": errors,
+            "message": f"Synced {imported} new activities from Strava ({skipped} already existed)"}
 
 @app.delete("/rides/clear")
 def clear_rides(user: dict = Depends(get_current_user)):
