@@ -1,11 +1,15 @@
 # ═══════════════════════════════════════════════════════════════════
 # CYCLING COACH API — main.py
 #
-# VERSION: 1.1.0  (2026-07-19)
+# VERSION: 1.2.0  (2026-07-19)
 # Check this against GET / on the live Railway URL before assuming
 # a deploy has actually landed — the two should always match.
 #
 # CHANGELOG
+#   1.2.0 (2026-07-19) — added POST /coaching/chat: real post-ride
+#                         coaching conversation (not the profile
+#                         interview) — pulls profile + last 5 rides +
+#                         recent notes into an ongoing chat
 #   1.1.0 (2026-07-19) — Strava sync bounded to YEAR regardless of
 #                         days_back (fixes 2024/2025 leak); dedup
 #                         widened to +/-1 day tolerance to catch
@@ -14,7 +18,7 @@
 #   1.0.0                initial live build — dashboard, FIT upload,
 #                         Strava OAuth + sync, AI profile interview
 # ═══════════════════════════════════════════════════════════════════
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Form
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -893,6 +897,100 @@ Only include fields where you extracted real information. Use null for unknown f
         cur.close(); conn.close()
 
     return {"reply": reply_text, "profile_update": profile_update}
+
+# ── Post-ride Coaching Chat ──────────────────────────────────────────────────
+
+@app.post("/coaching/chat")
+async def coaching_chat(
+    message: str = Form(...),
+    history: str = Form(default="[]"),
+    user: dict = Depends(get_current_user)
+):
+    """Ongoing post-ride coaching conversation. Distinct from /interview —
+    this is not intake, it's a coach who already knows the rider talking
+    through their recent rides, recovery, and trends."""
+    if not ANTHROPIC_KEY:
+        return {"reply": "AI coaching unavailable."}
+
+    import json as _json
+
+    conn = get_db(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT * FROM profiles WHERE user_id=%s", (user['id'],))
+    profile = cur.fetchone()
+    cur.execute("SELECT * FROM rides WHERE user_id=%s ORDER BY ride_date DESC LIMIT 5", (user['id'],))
+    recent = [dict(r) for r in cur.fetchall()]
+    cur.execute("SELECT note FROM coaching_notes WHERE user_id=%s ORDER BY created_at DESC LIMIT 5", (user['id'],))
+    notes = [r['note'] for r in cur.fetchall()]
+    cur.close(); conn.close()
+
+    profile_ctx = ""
+    if profile:
+        profile_ctx = "\nRIDER PROFILE:\n"
+        if profile.get('age'):            profile_ctx += "- Age: " + str(profile['age']) + "\n"
+        if profile.get('weight_lbs'):     profile_ctx += "- Weight: " + str(profile['weight_lbs']) + " lbs\n"
+        if profile.get('location'):       profile_ctx += "- Location: " + str(profile['location']) + "\n"
+        if profile.get('fitness_level'):  profile_ctx += "- Fitness: " + str(profile['fitness_level']) + "\n"
+        if profile.get('ftp'):            profile_ctx += "- FTP: " + str(profile['ftp']) + "W\n"
+        if profile.get('annual_goal_mi'): profile_ctx += "- Annual goal: " + str(profile['annual_goal_mi']) + " mi\n"
+        if profile.get('other_goals'):    profile_ctx += "- Goals: " + str(profile['other_goals']) + "\n"
+        if profile.get('health_notes'):   profile_ctx += "- Health: " + str(profile['health_notes']) + "\n"
+        if profile.get('injuries'):       profile_ctx += "- Injuries: " + str(profile['injuries']) + "\n"
+        if profile.get('heat_tolerance'): profile_ctx += "- Heat tolerance: " + str(profile['heat_tolerance']) + "\n"
+
+    rides_ctx = ""
+    if recent:
+        rides_ctx = "\nRECENT RIDES (most recent first):\n"
+        for r in recent:
+            rides_ctx += (
+                "- " + str(r.get('ride_date',''))[:10] + ": " + str(r.get('dist_mi','?')) + "mi, "
+                + str(r.get('duration_h','?')) + "h, avg pwr " + str(r.get('avg_power','?')) + "W, "
+                + "avg HR " + str(r.get('avg_hr','?')) + ", elev " + str(r.get('elev_gain_ft','?')) + "ft"
+                + (", virtual" if r.get('is_virtual') else "") + "\n"
+            )
+
+    notes_ctx = ""
+    if notes:
+        notes_ctx = "\nPERSONAL NOTES: " + "; ".join(notes) + "\n"
+
+    system_prompt = (
+        "You are an ongoing cycling coach chatting with an athlete after their rides. "
+        "This is NOT an intake interview — you already know them from the profile and ride "
+        "data below. Talk about how their recent ride(s) felt, recovery, trends versus their "
+        "goals, and give specific, practical guidance for what's next."
+        + profile_ctx + rides_ctx + notes_ctx +
+        "\n\nIMPORTANT RULES:\n"
+        "- If they mention chest pain, serious cardiac symptoms, or any acute medical concern: "
+        "tell them clearly to stop and see a doctor. Do not downplay it.\n"
+        "- If they mention wanting to lose weight, acknowledge it warmly but redirect specific "
+        "dietary advice to a nutritionist — you can speak to training load, not diet plans.\n"
+        "- If they mention recent illness (COVID, flu, etc.), factor in the post-viral "
+        "performance dip and adjust expectations accordingly.\n"
+        "- Reference specific numbers from their ride data when relevant — power, HR, distance, "
+        "elevation. Be concrete, not generic.\n"
+        "- Keep replies conversational, 2-5 sentences, unless they're asking for real detail."
+    )
+
+    try:
+        hist = _json.loads(history)
+    except:
+        hist = []
+
+    messages = list(hist) + [{"role": "user", "content": message}]
+
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01"},
+                json={"model": "claude-sonnet-4-6", "max_tokens": 400,
+                      "system": system_prompt, "messages": messages},
+                timeout=30
+            )
+            reply = resp.json()['content'][0]['text']
+    except Exception as e:
+        return {"reply": "Sorry, I had trouble connecting. Please try again."}
+
+    return {"reply": reply}
 
 # ── Strava Integration ───────────────────────────────────────────────────────
 
