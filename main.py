@@ -309,6 +309,11 @@ def build_full_dashboard(rides, name, annual_goal=None):
     def j(v): return _json.dumps(v)
 
     # Build JS strings (no f-strings with JS braces)
+    # Pace calculations (needed regardless of goal display)
+    pace_color = '#27AE60' if pace_ahead else '#E67E22'
+    pace_word  = 'ahead of' if pace_ahead else 'behind'
+    pace_bg    = '#E8F8F0' if pace_ahead else '#FEF0E8'
+
     # Build goal-dependent KPI cards
     if goal:
         goal_cards = (
@@ -437,10 +442,6 @@ def build_full_dashboard(rides, name, annual_goal=None):
         "if(ctx.datasetIndex===1)return '15s: '+(_p10[i]||'-')+'W';"
         "return '30s: '+(_p20[i]||'-')+'W';}}}}});"
     )
-
-    pace_color = '#27AE60' if pace_ahead else '#E67E22'
-    pace_word  = 'ahead of' if pace_ahead else 'behind'
-    pace_bg    = '#E8F8F0' if pace_ahead else '#FEF0E8'
 
     return (
         + "<!DOCTYPE html><html lang='en'><head>"
