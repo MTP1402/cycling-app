@@ -313,23 +313,23 @@ def build_full_dashboard(rides, name, annual_goal=None):
     if goal:
         goal_cards = (
             "<div class='stat-card'><div class='label'>Remaining</div>"
-            "<div class='value'>" + str(round(remaining,1)) + "</div>"
-            "<div class='sub'>miles to " + str(goal) + "</div></div>"
-            "<div class='stat-card " + ("green" if pace_ahead else "orange") + "'>"
-            "<div class='label'>Pace</div>"
-            "<div class='value'>" + str(abs(pace_diff)) + "</div>"
-            "<div class='sub'>miles " + pace_word + " pace</div></div>"
+            + "<div class='value'>" + str(round(remaining,1)) + "</div>"
+            + "<div class='sub'>miles to " + str(goal) + "</div></div>"
+            + "<div class='stat-card " + ("green" if pace_ahead else "orange") + "'>"
+            + "<div class='label'>Pace</div>"
+            + "<div class='value'>" + str(abs(pace_diff)) + "</div>"
+            + "<div class='sub'>miles " + pace_word + " pace</div></div>"
         )
         goal_subtitle = " &nbsp;&middot;&nbsp; Goal: " + str(goal) + " miles"
         goal_progress = (
             "<div class='progress-wrap'>"
-            "<div class='progress-label'>"
-            "<span><strong>" + str(round(total_mi,1)) + " mi</strong> completed</span>"
-            "<span>Goal: <strong>" + str(goal) + " mi</strong></span>"
-            "</div>"
-            "<div class='progress-bar-bg'>"
-            "<div class='progress-bar-fill' style='width:" + str(min(pct_complete,100)) + "%'></div>"
-            "</div></div>"
+            + "<div class='progress-label'>"
+            + "<span><strong>" + str(round(total_mi,1)) + " mi</strong> completed</span>"
+            + "<span>Goal: <strong>" + str(goal) + " mi</strong></span>"
+            + "</div>"
+            + "<div class='progress-bar-bg'>"
+            + "<div class='progress-bar-fill' style='width:" + str(min(pct_complete,100)) + "%'></div>"
+            + "</div></div>"
         )
     else:
         goal_cards = ""
