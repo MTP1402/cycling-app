@@ -364,37 +364,37 @@ def build_full_dashboard(rides, name, annual_goal=None):
     _tm = str(round(max_mi)); _th = str(round(max_hr))
     virt_html = (
         "<div style='font-size:11px;color:#555;margin-bottom:8px;'>"
-        "<span style='display:inline-flex;align-items:center;gap:4px;margin-right:12px;'>"
-        "<span style='width:10px;height:10px;border-radius:2px;background:#27AE60;display:inline-block;'></span>Outdoor</span>"
-        "<span style='display:inline-flex;align-items:center;gap:4px;'>"
-        "<span style='width:10px;height:10px;border-radius:2px;background:#9B59B6;display:inline-block;'></span>Virtual</span></div>"
-        "<div style='font-size:10px;color:#999;display:flex;justify-content:space-between;padding-left:84px;margin-bottom:2px;'>"
-        "<span>0</span><span>" + _pm + "</span>"
-        "<span style='color:#1F4E79;font-weight:600;'>Miles</span>"
-        "<span>" + _tm + "</span></div>"
-        "<div style='border-left:1.5px solid #ccc;margin-left:84px;padding:2px 0;'>"
-        "<div style='display:flex;align-items:center;position:relative;height:26px;margin-bottom:5px;'>"
-        "<span style='position:absolute;left:-88px;font-size:11px;color:#555;width:84px;text-align:right;padding-right:6px;'>Outdoor mi</span>"
-        "<div style='height:22px;width:" + str(pct_om) + "%;background:#27AE60CC;border-radius:0 4px 4px 0;display:flex;align-items:center;padding:0 8px;'>"
-        "<span style='font-size:11px;font-weight:600;color:#fff;'>" + _om + "</span></div></div>"
-        "<div style='display:flex;align-items:center;position:relative;height:26px;margin-bottom:5px;'>"
-        "<span style='position:absolute;left:-88px;font-size:11px;color:#555;width:84px;text-align:right;padding-right:6px;'>Virtual mi</span>"
-        "<div style='height:22px;width:" + str(pct_vm) + "%;background:#9B59B6CC;border-radius:0 4px 4px 0;display:flex;align-items:center;padding:0 8px;min-width:38px;'>"
-        "<span style='font-size:11px;font-weight:600;color:#fff;'>" + _vm + "</span></div></div></div>"
-        "<div style='height:10px;'></div>"
-        "<div style='font-size:10px;color:#999;display:flex;justify-content:space-between;padding-left:84px;margin-bottom:2px;'>"
-        "<span>0</span><span>" + _ph + "</span>"
-        "<span style='color:#1F4E79;font-weight:600;'>Hours</span>"
-        "<span>" + _th + "</span></div>"
-        "<div style='border-left:1.5px solid #ccc;margin-left:84px;padding:2px 0;'>"
-        "<div style='display:flex;align-items:center;position:relative;height:26px;margin-bottom:5px;'>"
-        "<span style='position:absolute;left:-88px;font-size:11px;color:#555;width:84px;text-align:right;padding-right:6px;'>Outdoor hr</span>"
-        "<div style='height:22px;width:" + str(pct_oh) + "%;background:#27AE60CC;border-radius:0 4px 4px 0;display:flex;align-items:center;padding:0 8px;'>"
-        "<span style='font-size:11px;font-weight:600;color:#fff;'>" + _oh + "</span></div></div>"
-        "<div style='display:flex;align-items:center;position:relative;height:26px;'>"
-        "<span style='position:absolute;left:-88px;font-size:11px;color:#555;width:84px;text-align:right;padding-right:6px;'>Virtual hr</span>"
-        "<div style='height:22px;width:" + str(pct_vh) + "%;background:#9B59B6CC;border-radius:0 4px 4px 0;display:flex;align-items:center;padding:0 8px;min-width:36px;'>"
-        "<span style='font-size:11px;font-weight:600;color:#fff;'>" + _vh + "</span></div></div></div>"
+        + "<span style='display:inline-flex;align-items:center;gap:4px;margin-right:12px;'>"
+        + "<span style='width:10px;height:10px;border-radius:2px;background:#27AE60;display:inline-block;'></span>Outdoor</span>"
+        + "<span style='display:inline-flex;align-items:center;gap:4px;'>"
+        + "<span style='width:10px;height:10px;border-radius:2px;background:#9B59B6;display:inline-block;'></span>Virtual</span></div>"
+        + "<div style='font-size:10px;color:#999;display:flex;justify-content:space-between;padding-left:84px;margin-bottom:2px;'>"
+        + "<span>0</span><span>" + _pm + "</span>"
+        + "<span style='color:#1F4E79;font-weight:600;'>Miles</span>"
+        + "<span>" + _tm + "</span></div>"
+        + "<div style='border-left:1.5px solid #ccc;margin-left:84px;padding:2px 0;'>"
+        + "<div style='display:flex;align-items:center;position:relative;height:26px;margin-bottom:5px;'>"
+        + "<span style='position:absolute;left:-88px;font-size:11px;color:#555;width:84px;text-align:right;padding-right:6px;'>Outdoor mi</span>"
+        + "<div style='height:22px;width:" + str(pct_om) + "%;background:#27AE60CC;border-radius:0 4px 4px 0;display:flex;align-items:center;padding:0 8px;'>"
+        + "<span style='font-size:11px;font-weight:600;color:#fff;'>" + _om + "</span></div></div>"
+        + "<div style='display:flex;align-items:center;position:relative;height:26px;margin-bottom:5px;'>"
+        + "<span style='position:absolute;left:-88px;font-size:11px;color:#555;width:84px;text-align:right;padding-right:6px;'>Virtual mi</span>"
+        + "<div style='height:22px;width:" + str(pct_vm) + "%;background:#9B59B6CC;border-radius:0 4px 4px 0;display:flex;align-items:center;padding:0 8px;min-width:38px;'>"
+        + "<span style='font-size:11px;font-weight:600;color:#fff;'>" + _vm + "</span></div></div></div>"
+        + "<div style='height:10px;'></div>"
+        + "<div style='font-size:10px;color:#999;display:flex;justify-content:space-between;padding-left:84px;margin-bottom:2px;'>"
+        + "<span>0</span><span>" + _ph + "</span>"
+        + "<span style='color:#1F4E79;font-weight:600;'>Hours</span>"
+        + "<span>" + _th + "</span></div>"
+        + "<div style='border-left:1.5px solid #ccc;margin-left:84px;padding:2px 0;'>"
+        + "<div style='display:flex;align-items:center;position:relative;height:26px;margin-bottom:5px;'>"
+        + "<span style='position:absolute;left:-88px;font-size:11px;color:#555;width:84px;text-align:right;padding-right:6px;'>Outdoor hr</span>"
+        + "<div style='height:22px;width:" + str(pct_oh) + "%;background:#27AE60CC;border-radius:0 4px 4px 0;display:flex;align-items:center;padding:0 8px;'>"
+        + "<span style='font-size:11px;font-weight:600;color:#fff;'>" + _oh + "</span></div></div>"
+        + "<div style='display:flex;align-items:center;position:relative;height:26px;'>"
+        + "<span style='position:absolute;left:-88px;font-size:11px;color:#555;width:84px;text-align:right;padding-right:6px;'>Virtual hr</span>"
+        + "<div style='height:22px;width:" + str(pct_vh) + "%;background:#9B59B6CC;border-radius:0 4px 4px 0;display:flex;align-items:center;padding:0 8px;min-width:36px;'>"
+        + "<span style='font-size:11px;font-weight:600;color:#fff;'>" + _vh + "</span></div></div></div>"
     )
     js_virt = ""
     js_elev  = "barChart('elevBar'," + j(ride_dates) + ",[{label:'Elev Gain (ft)',data:" + j(ride_elev) + ",backgroundColor:ORANGE+'CC'}]);"
@@ -868,6 +868,23 @@ Only include fields where you extracted real information. Use null for unknown f
 
 # ── Strava Integration ───────────────────────────────────────────────────────
 
+@app.get("/debug/dashboard")
+def debug_dashboard(user: dict = Depends(get_current_user)):
+    """Debug endpoint to show dashboard error details."""
+    import traceback
+    try:
+        conn = get_db(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT * FROM profiles WHERE user_id=%s", (user['id'],))
+        profile = cur.fetchone()
+        user_goal = int(profile['annual_goal_mi']) if profile and profile.get('annual_goal_mi') else ANNUAL_GOAL
+        cur.execute("SELECT * FROM rides WHERE user_id=%s AND ride_date >= %s AND ride_date < %s ORDER BY ride_date ASC LIMIT 5",
+            (user['id'], f'{YEAR}-01-01', f'{YEAR+1}-01-01'))
+        rides = [dict(r) for r in cur.fetchall()]; cur.close(); conn.close()
+        result = build_full_dashboard(rides, user['name'], annual_goal=user_goal)
+        return {"status": "ok", "html_length": len(result), "rides": len(rides), "goal": user_goal}
+    except Exception as e:
+        return {"status": "error", "error": str(e), "traceback": traceback.format_exc()}
+
 @app.get("/strava/connect")
 def strava_connect(_auth: str = ""):
     """Redirect user to Strava OAuth page. Token passed as _auth query param."""
@@ -1088,15 +1105,20 @@ def clear_rides(user: dict = Depends(get_current_user)):
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def get_dashboard(user: dict = Depends(get_current_user)):
-    conn = get_db(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    # Get user profile for personalized goal
-    cur.execute("SELECT * FROM profiles WHERE user_id=%s", (user['id'],))
-    profile = cur.fetchone()
-    user_goal = int(profile['annual_goal_mi']) if profile and profile.get('annual_goal_mi') else ANNUAL_GOAL
-    # Filter to current year only
-    cur.execute("""SELECT * FROM rides WHERE user_id=%s
-        AND ride_date >= %s AND ride_date < %s
-        ORDER BY ride_date ASC""",
-        (user['id'], f'{YEAR}-01-01', f'{YEAR+1}-01-01'))
-    rides = [dict(r) for r in cur.fetchall()]; cur.close(); conn.close()
-    return HTMLResponse(content=build_full_dashboard(rides, user['name'], annual_goal=user_goal))
+    try:
+        conn = get_db(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT * FROM profiles WHERE user_id=%s", (user['id'],))
+        profile = cur.fetchone()
+        user_goal = int(profile['annual_goal_mi']) if profile and profile.get('annual_goal_mi') else ANNUAL_GOAL
+        cur.execute("""SELECT * FROM rides WHERE user_id=%s
+            AND ride_date >= %s AND ride_date < %s
+            ORDER BY ride_date ASC""",
+            (user['id'], f'{YEAR}-01-01', f'{YEAR+1}-01-01'))
+        rides = [dict(r) for r in cur.fetchall()]; cur.close(); conn.close()
+        html = build_full_dashboard(rides, user['name'], annual_goal=user_goal)
+        return HTMLResponse(content=html)
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        print("DASHBOARD ERROR:", tb)
+        return HTMLResponse(content="<pre style='color:red;padding:20px;'>" + tb + "</pre>", status_code=500)
