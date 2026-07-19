@@ -999,9 +999,12 @@ async def strava_sync(
                         (access_token, new_tokens['refresh_token'], new_tokens['expires_at'], user['id']))
             cur2.close()
 
-    # Fetch activities
-    after_ts = int(time.time()) - (days_back * 86400)
-    imported = 0; skipped = 0; errors = 0
+    # Fetch activities — never go further back than Jan 1 of YEAR,
+    # regardless of days_back. This is what caused the 2024/2025 leak.
+    days_back_ts  = int(time.time()) - (days_back * 86400)
+    year_start_ts = int(datetime(YEAR, 1, 1).timestamp())
+    after_ts = max(days_back_ts, year_start_ts)
+    imported = 0; skipped = 0; errors = 0; out_of_range = 0
     page = 1
 
     async with httpx.AsyncClient() as client:
@@ -1018,6 +1021,12 @@ async def strava_sync(
             for act in activities:
                 try:
                     act_date = act.get('start_date_local','')[:10]
+                    # Hard safety net: skip anything outside the current YEAR
+                    # even if it slipped past the after_ts filter (e.g. local
+                    # timezone landing an activity just before Jan 1).
+                    if act_date < f'{YEAR}-01-01' or act_date >= f'{YEAR+1}-01-01':
+                        out_of_range += 1
+                        continue
                     dist_mi  = round((act.get('distance') or 0) / 1609.34, 2)
                     dur_h    = round((act.get('moving_time') or 0) / 3600, 2)
                     sport    = act.get('sport_type','').lower()
@@ -1094,8 +1103,9 @@ async def strava_sync(
     cur.execute("UPDATE strava_tokens SET last_sync=NOW() WHERE user_id=%s", (user['id'],))
     cur.close(); conn.close()
 
-    return {"imported": imported, "skipped": skipped, "errors": errors,
-            "message": f"Synced {imported} new activities from Strava ({skipped} already existed)"}
+    return {"imported": imported, "skipped": skipped, "errors": errors, "out_of_range": out_of_range,
+            "message": f"Synced {imported} new activities from Strava ({skipped} already existed, "
+                       f"{out_of_range} outside {YEAR})"}
 
 @app.delete("/rides/clear")
 def clear_rides(user: dict = Depends(get_current_user)):
