@@ -1,11 +1,14 @@
 # ═══════════════════════════════════════════════════════════════════
 # CYCLING COACH API — main.py
 #
-# VERSION: 1.3.0  (2026-07-19)
+# VERSION: 1.4.0  (2026-07-19)
 # Check this against GET / on the live Railway URL before assuming
 # a deploy has actually landed — the two should always match.
 #
 # CHANGELOG
+#   1.4.0 (2026-07-19) — added GET /admin/users (roster of everyone
+#                         signed up, ride counts, Strava/profile
+#                         status) — restricted to ADMIN_EMAILS
 #   1.3.0 (2026-07-19) — added document import: POST /coaching/import,
 #                         GET /coaching/imports, DELETE /coaching/
 #                         imports/{id}. Text/markdown only (handoff
@@ -31,7 +34,8 @@
 #   1.0.0                initial live build — dashboard, FIT upload,
 #                         Strava OAuth + sync, AI profile interview
 # ═══════════════════════════════════════════════════════════════════
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
+ADMIN_EMAILS = {"mtpujol@gmail.com"}
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Form
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -1112,6 +1116,24 @@ def debug_dashboard(user: dict = Depends(get_current_user)):
         return {"status": "ok", "html_length": len(result), "rides": len(rides), "goal": user_goal}
     except Exception as e:
         return {"status": "error", "error": str(e), "traceback": traceback.format_exc()}
+
+@app.get("/admin/users")
+def admin_list_users(user: dict = Depends(get_current_user)):
+    """Roster of everyone signed up — restricted to ADMIN_EMAILS."""
+    if user['email'] not in ADMIN_EMAILS:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    conn = get_db(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("""
+        SELECT u.id, u.name, u.email, u.created_at,
+            (SELECT COUNT(*) FROM rides r WHERE r.user_id=u.id) AS ride_count,
+            (SELECT MAX(ride_date) FROM rides r WHERE r.user_id=u.id) AS last_ride,
+            EXISTS(SELECT 1 FROM strava_tokens st WHERE st.user_id=u.id) AS strava_connected,
+            EXISTS(SELECT 1 FROM profiles p WHERE p.user_id=u.id AND p.interview_complete=true) AS profile_complete
+        FROM users u ORDER BY u.created_at DESC
+    """)
+    users = [dict(r) for r in cur.fetchall()]
+    cur.close(); conn.close()
+    return {"users": users, "count": len(users)}
 
 @app.get("/strava/connect")
 def strava_connect(_auth: str = ""):
