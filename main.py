@@ -1,11 +1,22 @@
 # ═══════════════════════════════════════════════════════════════════
 # CYCLING COACH API — main.py
 #
-# VERSION: 1.6.0  (2026-07-19)
+# VERSION: 1.7.0  (2026-07-19)
 # Check this against GET / on the live Railway URL before assuming
 # a deploy has actually landed — the two should always match.
 #
 # CHANGELOG
+#   1.7.0 (2026-07-19) — added 5-minute best power (p300), computed
+#                         the same way as the existing 5s/15s/30s
+#                         bests. New DB column, captured on both FIT
+#                         upload and Strava sync. Shown on the Sprint
+#                         Power chart as a separate purple line
+#                         overlaid on the existing stacked bars —
+#                         didn't touch the 5s/15s/30s stack itself,
+#                         since 5-min is a different kind of metric
+#                         (aerobic capacity, not anaerobic burst) and
+#                         forcing it into the same stack would've
+#                         misrepresented both.
 #   1.6.0 (2026-07-19) — added 1M/3M/6M/YTD/All range buttons above
 #                         the 7 zoomable charts. Buttons jump the
 #                         zoom window via chart.zoomScale() — free
@@ -50,7 +61,7 @@
 #   1.0.0                initial live build — dashboard, FIT upload,
 #                         Strava OAuth + sync, AI profile interview
 # ═══════════════════════════════════════════════════════════════════
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.7.0"
 ADMIN_EMAILS = {"mtpujol@gmail.com"}
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Form
@@ -141,6 +152,7 @@ def init_db():
         ALTER TABLE rides ADD COLUMN IF NOT EXISTS elev_gain_ft FLOAT;
         ALTER TABLE rides ADD COLUMN IF NOT EXISTS ride_type TEXT DEFAULT 'General';
         ALTER TABLE rides ADD COLUMN IF NOT EXISTS is_virtual BOOLEAN DEFAULT FALSE;
+        ALTER TABLE rides ADD COLUMN IF NOT EXISTS p300 INTEGER;
     """)
     cur.close(); conn.close()
 
@@ -244,6 +256,7 @@ def parse_fit_bytes(data):
             'p5':   best_avg(powers, 5),
             'p15':  best_avg(powers, 15),
             'p30':  best_avg(powers, 30),
+            'p300': best_avg(powers, 300),
             'elev_gain_ft': elev_gain_ft,
             'ride_type':   ride_type,
             'is_virtual':  is_virtual,
@@ -356,6 +369,7 @@ def build_full_dashboard(rides, name, annual_goal=None):
     coach_p5     = [r.get('p5')  for r in coach_rides]
     coach_p10    = [r.get('p15') for r in coach_rides]
     coach_p20    = [r.get('p30') for r in coach_rides]
+    coach_p300   = [r.get('p300') for r in coach_rides]
     coach_p10_mid = [(int(p10 or 0) - int(p20 or 0)) if p10 and p20 else None for p10,p20 in zip(coach_p10, coach_p20)]
     coach_p5_top  = [(int(p5  or 0) - int(p10 or 0)) if p5  and p10 else None for p5, p10 in zip(coach_p5,  coach_p10)]
 
@@ -498,18 +512,22 @@ def build_full_dashboard(rides, name, annual_goal=None):
     js_sprint_p5  = j(coach_p5)
     js_sprint_p10 = j(coach_p10)
     js_sprint_p20 = j(coach_p20)
+    js_sprint_p300 = j(coach_p300)
     js_coach_sprint = (
-        "var _p5=" + js_sprint_p5 + ",_p10=" + js_sprint_p10 + ",_p20=" + js_sprint_p20 + ";"
+        "var _p5=" + js_sprint_p5 + ",_p10=" + js_sprint_p10 + ",_p20=" + js_sprint_p20 + ",_p300=" + js_sprint_p300 + ";"
         "barChart('coachSprint'," + j(coach_dates) + ","
         "[{label:'30s base',data:" + j(coach_p20) + ",backgroundColor:'#27AE60CC',stack:'s'},"
         "{label:'15s mid',data:" + j(coach_p10_mid) + ",backgroundColor:'#2E75B6CC',stack:'s'},"
-        "{label:'5s burst',data:" + j(coach_p5_top) + ",backgroundColor:'#E67E22CC',stack:'s'}],"
+        "{label:'5s burst',data:" + j(coach_p5_top) + ",backgroundColor:'#E67E22CC',stack:'s'},"
+        "{label:'Best 5-min Power (W)',data:" + j(coach_p300) + ",type:'line',borderColor:PURPLE,"
+        "backgroundColor:PURPLE+'20',borderWidth:2,pointRadius:2,fill:false,spanGaps:true,order:0}],"
         "{scales:{y:{stacked:true,beginAtZero:true},x:{stacked:true,ticks:{maxRotation:45}}},"
         "zoomable:true,"
         "plugins:{tooltip:{mode:'index',intersect:false,"
         "itemSort:function(a,b){return b.datasetIndex-a.datasetIndex;},"
         "callbacks:{label:function(ctx){"
         "var i=ctx.dataIndex;"
+        "if(ctx.datasetIndex===3)return '5-min: '+(_p300[i]||'-')+'W';"
         "if(ctx.datasetIndex===2)return '5s: '+(_p5[i]||'-')+'W';"
         "if(ctx.datasetIndex===1)return '15s: '+(_p10[i]||'-')+'W';"
         "return '30s: '+(_p20[i]||'-')+'W';}}}}});"
@@ -611,7 +629,7 @@ def build_full_dashboard(rides, name, annual_goal=None):
         + "<div class='chart-card'><h3>&#x26A1; Avg Power vs Normalized Power (W) <a href='#' onclick=\"resetZoom('coachPower');return false;\" style='float:right;font-size:10px;color:#888;font-weight:400;text-decoration:none;'>&#8635; reset zoom</a></h3><canvas id='coachPower'></canvas></div>"
         + "<div class='chart-card'><h3>&#x2764;&#xFE0F; Avg HR vs Max HR (bpm) <a href='#' onclick=\"resetZoom('coachHR');return false;\" style='float:right;font-size:10px;color:#888;font-weight:400;text-decoration:none;'>&#8635; reset zoom</a></h3><canvas id='coachHR'></canvas></div>"
         + "<div class='chart-card'><h3>&#x1F504; Avg Cadence vs Max Cadence (rpm) <a href='#' onclick=\"resetZoom('coachCad');return false;\" style='float:right;font-size:10px;color:#888;font-weight:400;text-decoration:none;'>&#8635; reset zoom</a></h3><canvas id='coachCad'></canvas></div>"
-        + "<div class='chart-card'><h3>&#x1F3CE;&#xFE0F; Sprint Power &#x2014; 5s / 15s / 30s Best (W) <a href='#' onclick=\"resetZoom('coachSprint');return false;\" style='float:right;font-size:10px;color:#888;font-weight:400;text-decoration:none;'>&#8635; reset zoom</a></h3><canvas id='coachSprint'></canvas></div>"
+        + "<div class='chart-card'><h3>&#x1F3CE;&#xFE0F; Sprint &amp; Aerobic Power &#x2014; 5s / 15s / 30s / 5-min Best (W) <a href='#' onclick=\"resetZoom('coachSprint');return false;\" style='float:right;font-size:10px;color:#888;font-weight:400;text-decoration:none;'>&#8635; reset zoom</a></h3><canvas id='coachSprint'></canvas></div>"
         + "</div>"
 
         + "<p class='footer'>Generated by Cycling Coach &nbsp;&middot;&nbsp; " + date.today().strftime('%Y-%m-%d') + "</p>"
@@ -796,14 +814,14 @@ async def upload_fit(file: UploadFile = File(...), notes: str = Form(default="")
         return {"ride_id": existing[0], "metrics": metrics, "coaching": "Already in your database.", "duplicate": True}
     cur.execute("""INSERT INTO rides (user_id,ride_date,name,dist_mi,duration_h,
         avg_power,norm_power,avg_hr,max_hr,avg_cadence,max_cadence,
-        p5,p15,p30,elev_gain_ft,ride_type,is_virtual,temp_c,notes)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+        p5,p15,p30,p300,elev_gain_ft,ride_type,is_virtual,temp_c,notes)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
         (user['id'], metrics['ride_date'], metrics.get('name'),
          metrics.get('dist_mi'), metrics.get('duration_h'),
          metrics.get('avg_power'), metrics.get('norm_power'),
          metrics.get('avg_hr'), metrics.get('max_hr'),
          metrics.get('avg_cadence'), metrics.get('max_cadence'),
-         metrics.get('p5'), metrics.get('p15'), metrics.get('p30'),
+         metrics.get('p5'), metrics.get('p15'), metrics.get('p30'), metrics.get('p300'),
          metrics.get('elev_gain_ft'), metrics.get('ride_type','General'),
          metrics.get('is_virtual', False), metrics.get('temp_c'), notes))
     ride_id = cur.fetchone()[0]; cur.close(); conn.close()
@@ -1413,13 +1431,13 @@ async def strava_sync(
 
                     cur3.execute("""INSERT INTO rides (user_id,ride_date,name,dist_mi,duration_h,
                         avg_power,norm_power,avg_hr,max_hr,avg_cadence,max_cadence,
-                        p5,p15,p30,elev_gain_ft,ride_type,is_virtual,temp_c,notes)
-                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                        p5,p15,p30,p300,elev_gain_ft,ride_type,is_virtual,temp_c,notes)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                         (user['id'], act_date, act.get('name','Activity'),
                          dist_mi, dur_h, avg_power, np_val,
                          avg_hr, act.get('max_heartrate'),
                          avg_cad, max(cads) if cads else None,
-                         best_avg(powers,5), best_avg(powers,15), best_avg(powers,30),
+                         best_avg(powers,5), best_avg(powers,15), best_avg(powers,30), best_avg(powers,300),
                          elev_ft, ride_type, is_virt,
                          act.get('average_temp'), None))
                     cur3.close()
