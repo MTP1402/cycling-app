@@ -1,11 +1,20 @@
 # ═══════════════════════════════════════════════════════════════════
 # CYCLING COACH API — main.py
 #
-# VERSION: 1.9.3  (2026-07-23)
+# VERSION: 1.9.4  (2026-07-23)
 # Check this against GET / on the live Railway URL before assuming
 # a deploy has actually landed — the two should always match.
 #
 # CHANGELOG
+#   1.9.4 (2026-07-23) — the new edit-log-entry endpoint used PATCH,
+#                         and PowerShell's Invoke-RestMethod doesn't
+#                         reliably form-encode a hashtable body for
+#                         PATCH the way it does for POST — the date
+#                         fix request came through with entry_date
+#                         empty despite being provided. Switched to
+#                         POST on the same path (DELETE stays as-is,
+#                         no conflict) — same method that's worked
+#                         cleanly for every other write in this app.
 #   1.9.3 (2026-07-23) — added PATCH /coaching/memory/log/{id} (fix a
 #                         wrong date or summary on an existing dated
 #                         entry) and DELETE /coaching/memory/log/{id}
@@ -1511,7 +1520,7 @@ def get_memory(user: dict = Depends(get_current_user)):
     cur.close(); conn.close()
     return {"dated_log": log, "themes": themes}
 
-@app.patch("/coaching/memory/log/{entry_id}")
+@app.post("/coaching/memory/log/{entry_id}")
 def edit_memory_log_entry(
     entry_id: int,
     entry_date: str = Form(default=None),
