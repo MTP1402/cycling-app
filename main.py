@@ -1,11 +1,23 @@
 # ═══════════════════════════════════════════════════════════════════
 # CYCLING COACH API — main.py
 #
-# VERSION: 1.9.0  (2026-07-22)
+# VERSION: 1.9.1  (2026-07-22)
 # Check this against GET / on the live Railway URL before assuming
 # a deploy has actually landed — the two should always match.
 #
 # CHANGELOG
+#   1.9.1 (2026-07-22) — /coaching/memory/seed failed with "Could not
+#                         parse extraction result as JSON" — the model
+#                         wrapped its response in markdown code fences
+#                         despite being told not to (a common LLM
+#                         habit that shouldn't have been trusted away
+#                         with an instruction alone). Added a shared
+#                         extract_json_object() helper that pulls the
+#                         JSON out regardless of fences or stray text
+#                         around it, used everywhere the memory system
+#                         parses AI-generated JSON — the seed endpoint,
+#                         and both places /coaching/chat and /upload's
+#                         summary extract memory updates.
 #   1.9.0 (2026-07-22) — hybrid coaching memory: a dated log (one
 #                         distilled entry per ride/episode actually
 #                         worth remembering) plus five standing
@@ -128,6 +140,7 @@ import hashlib
 import secrets
 import os
 import json
+import re
 import tempfile
 from datetime import datetime, date, timedelta
 from collections import defaultdict
@@ -232,6 +245,15 @@ def init_db():
 
 def hash_password(pw):
     return hashlib.sha256(pw.encode()).hexdigest()
+
+def extract_json_object(text):
+    """Pull a JSON object out of AI output that may be wrapped in markdown code
+    fences or have stray text around it (models don't always follow a "JSON
+    only" instruction to the letter). Raises if nothing parseable is found."""
+    match = re.search(r'\{.*\}', text, re.DOTALL)
+    if not match:
+        raise ValueError("No JSON object found in text")
+    return json.loads(match.group(0))
 
 def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
     conn = get_db(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
@@ -879,7 +901,7 @@ async def get_coaching_summary(user, metrics):
             parts = full_text.split('MEMORY_UPDATE:', 1)
             assessment_text = parts[0].strip()
             try:
-                mem_update = json.loads(parts[1].strip())
+                mem_update = extract_json_object(parts[1].strip())
             except Exception:
                 mem_update = {}
             if mem_update:
@@ -1413,7 +1435,7 @@ async def coaching_chat(
         parts = reply.split('MEMORY_UPDATE:', 1)
         reply_text = parts[0].strip()
         try:
-            mem_update = _json.loads(parts[1].strip())
+            mem_update = extract_json_object(parts[1].strip())
         except Exception:
             mem_update = {}
         if mem_update:
@@ -1505,7 +1527,7 @@ async def seed_memory(text: str = Form(...), user: dict = Depends(get_current_us
         raise HTTPException(status_code=502, detail="Extraction request failed: " + str(e))
 
     try:
-        parsed = json.loads(raw)
+        parsed = extract_json_object(raw)
     except Exception:
         raise HTTPException(status_code=502, detail="Could not parse extraction result as JSON")
 
