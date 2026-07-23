@@ -1,11 +1,34 @@
 # ═══════════════════════════════════════════════════════════════════
 # CYCLING COACH API — main.py
 #
-# VERSION: 1.8.0  (2026-07-22)
+# VERSION: 1.9.0  (2026-07-22)
 # Check this against GET / on the live Railway URL before assuming
 # a deploy has actually landed — the two should always match.
 #
 # CHANGELOG
+#   1.9.0 (2026-07-22) — hybrid coaching memory: a dated log (one
+#                         distilled entry per ride/episode actually
+#                         worth remembering) plus five standing
+#                         pattern threads (hydration/fueling, effort
+#                         perception, recovery/readiness, environment,
+#                         life context) that update over time rather
+#                         than growing forever. Both /upload's summary
+#                         and /coaching/chat now read this memory into
+#                         context and can update it after every
+#                         exchange, via a trailing JSON block the AI
+#                         produces and the backend parses out (never
+#                         shown to the user) — no separate API call
+#                         needed for the update. New: GET /coaching/
+#                         memory to see what's stored, POST /coaching/
+#                         memory/seed to retroactively import
+#                         historical conversation content using the
+#                         same distillation approach, so this can
+#                         start from real history instead of zero.
+#                         Cost impact at current scale is negligible —
+#                         a modest addition to what's already sent per
+#                         message, no unbounded growth over time since
+#                         old raw content isn't retained, only the
+#                         compressed memory it produced.
 #   1.8.0 (2026-07-22) — coaching got noticeably deeper and more
 #                         curious, closer to a real coaching session:
 #                         both /upload's post-ride summary and the
@@ -126,6 +149,17 @@ ANNUAL_GOAL    = 6500
 WEEKLY_TARGET  = 125
 YEAR           = 2026
 
+# Coaching memory themes — standing patterns tracked across sessions, separate
+# from the dated log (which is per-ride/per-episode). Keys are the DB values;
+# labels are what gets shown to the AI in context.
+MEMORY_THEMES = {
+    'hydration_fueling':     'Hydration & Fueling',
+    'effort_perception':     'Effort & Perceived Exertion',
+    'recovery_readiness':    'Recovery & Readiness',
+    'environmental_context': 'Environmental Context',
+    'life_context':          'Life Context',
+}
+
 def get_db():
     conn = psycopg2.connect(DATABASE_URL)
     conn.autocommit = True
@@ -178,6 +212,15 @@ def init_db():
         CREATE TABLE IF NOT EXISTS imported_docs (
             id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id),
             filename TEXT, content TEXT, created_at TIMESTAMP DEFAULT NOW()
+        );
+        CREATE TABLE IF NOT EXISTS coaching_memory_log (
+            id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id),
+            entry_date DATE, summary TEXT, created_at TIMESTAMP DEFAULT NOW()
+        );
+        CREATE TABLE IF NOT EXISTS coaching_memory_themes (
+            id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id),
+            theme TEXT, content TEXT, updated_at TIMESTAMP DEFAULT NOW(),
+            UNIQUE(user_id, theme)
         );
         -- Add missing columns if upgrading from old schema
         ALTER TABLE rides ADD COLUMN IF NOT EXISTS elev_gain_ft FLOAT;
@@ -747,6 +790,10 @@ async def get_coaching_summary(user, metrics):
         notes = [r['note'] for r in cur.fetchall()]
         cur.execute("SELECT * FROM profiles WHERE user_id=%s", (user['id'],))
         profile = cur.fetchone()
+        cur.execute("SELECT entry_date, summary FROM coaching_memory_log WHERE user_id=%s ORDER BY entry_date DESC LIMIT 30", (user['id'],))
+        memory_log = [dict(r) for r in cur.fetchall()]
+        cur.execute("SELECT theme, content FROM coaching_memory_themes WHERE user_id=%s", (user['id'],))
+        memory_themes = {r['theme']: r['content'] for r in cur.fetchall()}
         cur.close(); conn.close()
 
         profile_ctx = ""
@@ -769,10 +816,23 @@ async def get_coaching_summary(user, metrics):
             for r in recent[:5]:
                 recent_ctx += "- " + str(r.get('ride_date',''))[:10] + ": " + str(r.get('dist_mi','')) + "mi, HR " + str(r.get('avg_hr','')) + ", pwr " + str(r.get('avg_power','')) + "W\n"
 
+        memory_log_ctx = ""
+        if memory_log:
+            memory_log_ctx = "\nCOACHING MEMORY — DATED LOG (most recent first):\n"
+            for m in memory_log:
+                memory_log_ctx += "- " + str(m['entry_date']) + ": " + str(m['summary']) + "\n"
+
+        memory_themes_ctx = ""
+        if memory_themes:
+            memory_themes_ctx = "\nCOACHING MEMORY — STANDING PATTERNS:\n"
+            for key, label in MEMORY_THEMES.items():
+                if memory_themes.get(key):
+                    memory_themes_ctx += "- " + label + ": " + str(memory_themes[key]) + "\n"
+
         prompt = (
             profile_ctx + "\n"
             + ("PERSONAL NOTES: " + "; ".join(notes) + "\n\n" if notes else "")
-            + recent_ctx + "\n"
+            + recent_ctx + memory_log_ctx + memory_themes_ctx + "\n"
             + "LATEST RIDE:\n"
             + "- Date: " + str(metrics.get('ride_date','')) + "\n"
             + "- Distance: " + str(metrics.get('dist_mi','')) + " mi\n"
@@ -790,17 +850,58 @@ async def get_coaching_summary(user, metrics):
             + "illness or injury, factor that in. If pre/post-ride weight, fluid intake, or food "
             + "during the ride isn't in their notes, mention briefly that logging it (in Post-Ride "
             + "Debrief or the Coaching tab) would sharpen future hydration/fueling feedback — don't "
-            + "belabor it, one line is enough. End with one specific, actionable thing for next time."
+            + "belabor it, one line is enough. End with one specific, actionable thing for next time.\n\n"
+            + "After your assessment, on a new line, write exactly MEMORY_UPDATE: with nothing else "
+            + "on that line, then on the next line a single JSON object (only JSON, no markdown "
+            + "fences) shaped like: {\"dated_entry\": {\"date\":\"YYYY-MM-DD\",\"summary\":\"...\"} "
+            + "or null, \"theme_updates\": {\"hydration_fueling\":\"...\" or null, "
+            + "\"effort_perception\":\"...\" or null, \"recovery_readiness\":\"...\" or null, "
+            + "\"environmental_context\":\"...\" or null, \"life_context\":\"...\" or null}}. "
+            + "Include a dated_entry for this ride if anything is worth remembering later. Only "
+            + "fill in a theme_update for a theme this ride actually informs; each one you include "
+            + "must be the FULL updated pattern (folding in what's new with what's shown above), "
+            + "not just the new piece. Keep every summary/update to 2-3 sentences, distilled."
         )
         async with httpx.AsyncClient() as client:
             resp = await client.post(
                 "https://api.anthropic.com/v1/messages",
                 headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01"},
-                json={"model":"claude-sonnet-4-6","max_tokens":600,
+                json={"model":"claude-sonnet-4-6","max_tokens":800,
                       "messages":[{"role":"user","content":prompt}]},
                 timeout=30
             )
-            return resp.json()['content'][0]['text']
+            full_text = resp.json()['content'][0]['text']
+
+        # Extract the trailing memory-update JSON and apply it — same pattern as
+        # /coaching/chat. The user only ever sees the text before this marker.
+        assessment_text = full_text
+        if 'MEMORY_UPDATE:' in full_text:
+            parts = full_text.split('MEMORY_UPDATE:', 1)
+            assessment_text = parts[0].strip()
+            try:
+                mem_update = json.loads(parts[1].strip())
+            except Exception:
+                mem_update = {}
+            if mem_update:
+                conn2 = get_db(); cur2 = conn2.cursor()
+                de = mem_update.get('dated_entry')
+                if de and de.get('date') and de.get('summary'):
+                    cur2.execute(
+                        "INSERT INTO coaching_memory_log (user_id, entry_date, summary) VALUES (%s,%s,%s)",
+                        (user['id'], de['date'], de['summary'])
+                    )
+                tu = mem_update.get('theme_updates') or {}
+                for theme_key in MEMORY_THEMES:
+                    content = tu.get(theme_key)
+                    if content:
+                        cur2.execute("""
+                            INSERT INTO coaching_memory_themes (user_id, theme, content, updated_at)
+                            VALUES (%s,%s,%s,NOW())
+                            ON CONFLICT (user_id, theme) DO UPDATE SET content=EXCLUDED.content, updated_at=NOW()
+                        """, (user['id'], theme_key, content))
+                cur2.close(); conn2.close()
+
+        return assessment_text
     except Exception as e:
         return "Coaching summary unavailable: " + str(e)
 
@@ -1132,6 +1233,10 @@ async def coaching_chat(
     notes = [r['note'] for r in cur.fetchall()]
     cur.execute("SELECT filename, content FROM imported_docs WHERE user_id=%s ORDER BY created_at DESC LIMIT 1", (user['id'],))
     imported = cur.fetchone()
+    cur.execute("SELECT entry_date, summary FROM coaching_memory_log WHERE user_id=%s ORDER BY entry_date DESC LIMIT 30", (user['id'],))
+    memory_log = [dict(r) for r in cur.fetchall()]
+    cur.execute("SELECT theme, content FROM coaching_memory_themes WHERE user_id=%s", (user['id'],))
+    memory_themes = {r['theme']: r['content'] for r in cur.fetchall()}
     cur.close(); conn.close()
 
     goal = int(profile['annual_goal_mi']) if profile and profile.get('annual_goal_mi') else ANNUAL_GOAL
@@ -1189,6 +1294,19 @@ async def coaching_chat(
             + str(imported['content'])[:IMPORT_MAX_PROMPT_CHARS] + "\n"
         )
 
+    memory_log_ctx = ""
+    if memory_log:
+        memory_log_ctx = "\nCOACHING MEMORY — DATED LOG (most recent first):\n"
+        for m in memory_log:
+            memory_log_ctx += "- " + str(m['entry_date']) + ": " + str(m['summary']) + "\n"
+
+    memory_themes_ctx = ""
+    if memory_themes:
+        memory_themes_ctx = "\nCOACHING MEMORY — STANDING PATTERNS:\n"
+        for key, label in MEMORY_THEMES.items():
+            if memory_themes.get(key):
+                memory_themes_ctx += "- " + label + ": " + str(memory_themes[key]) + "\n"
+
     system_prompt = (
         "You are an ongoing cycling coach chatting with an athlete after their rides. "
         "This is NOT an intake interview — you already know them from the profile and ride "
@@ -1196,7 +1314,7 @@ async def coaching_chat(
         "goals, and give specific, practical guidance for what's next. You have their exact "
         "year-to-date mileage and pace vs. goal below — use those real numbers, never ask the "
         "rider to tell you their own totals."
-        + profile_ctx + ytd_ctx + rides_ctx + notes_ctx + imported_ctx +
+        + profile_ctx + ytd_ctx + rides_ctx + notes_ctx + imported_ctx + memory_log_ctx + memory_themes_ctx +
         "\n\nIMPORTANT RULES:\n"
         "- If they mention chest pain, serious cardiac symptoms, or any acute medical concern: "
         "tell them clearly to stop and see a doctor. Do not downplay it.\n"
@@ -1245,6 +1363,24 @@ async def coaching_chat(
         "is 1-2 sentences. Do not restate or paraphrase what the rider just told you before "
         "responding (skip lines like 'That's great news, sustaining 200+ watts with HR around "
         "140!') — go straight to the point.\n"
+        "- You have a running coaching memory above — a dated log of past rides/episodes "
+        "discussed, and standing patterns across five themes. Reference it naturally when "
+        "relevant, the way you'd recall something from an earlier session. If asked about a "
+        "specific date, check the dated log first.\n"
+        "- At the very end of your reply, after everything else, add a line reading exactly "
+        "MEMORY_UPDATE: with nothing else on that line, then on the next line a single JSON "
+        "object (only JSON, no other text, no markdown fences) with this exact shape:\n"
+        "{\"dated_entry\": {\"date\":\"YYYY-MM-DD\",\"summary\":\"...\"} or null, "
+        "\"theme_updates\": {\"hydration_fueling\":\"...\" or null, \"effort_perception\":\"...\" "
+        "or null, \"recovery_readiness\":\"...\" or null, \"environmental_context\":\"...\" or "
+        "null, \"life_context\":\"...\" or null}}\n"
+        "Only include a dated_entry if a specific ride or dated episode was actually discussed "
+        "with something worth remembering later — skip it for routine check-ins with nothing "
+        "new. Only fill in a theme_update for a theme this exchange actually informed; leave "
+        "the rest null. Each theme_update you DO include must be the FULL updated standing "
+        "pattern for that theme (folding in what's new with what's already there above), not "
+        "just the new piece — it replaces the old content entirely. Keep every summary and "
+        "theme update to 2-3 sentences, distilled and durable, not verbatim conversation.\n"
         "- Tone throughout: a knowledgeable coach, direct and matter-of-fact — not a chatty "
         "friend, but genuinely engaged with the specifics of what they tell you."
     )
@@ -1261,7 +1397,7 @@ async def coaching_chat(
             resp = await client.post(
                 "https://api.anthropic.com/v1/messages",
                 headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01"},
-                json={"model": "claude-sonnet-4-6", "max_tokens": 700,
+                json={"model": "claude-sonnet-4-6", "max_tokens": 900,
                       "system": system_prompt, "messages": messages},
                 timeout=30
             )
@@ -1269,7 +1405,135 @@ async def coaching_chat(
     except Exception as e:
         return {"reply": "Sorry, I had trouble connecting. Please try again."}
 
-    return {"reply": reply}
+    # Extract the trailing memory-update JSON (same trailing-JSON pattern already
+    # used in /interview for profile extraction) and apply it to the DB. The user
+    # never sees this block — only the reply text before it.
+    reply_text = reply
+    if 'MEMORY_UPDATE:' in reply:
+        parts = reply.split('MEMORY_UPDATE:', 1)
+        reply_text = parts[0].strip()
+        try:
+            mem_update = _json.loads(parts[1].strip())
+        except Exception:
+            mem_update = {}
+        if mem_update:
+            conn2 = get_db(); cur2 = conn2.cursor()
+            de = mem_update.get('dated_entry')
+            if de and de.get('date') and de.get('summary'):
+                cur2.execute(
+                    "INSERT INTO coaching_memory_log (user_id, entry_date, summary) VALUES (%s,%s,%s)",
+                    (user['id'], de['date'], de['summary'])
+                )
+            tu = mem_update.get('theme_updates') or {}
+            for theme_key in MEMORY_THEMES:
+                content = tu.get(theme_key)
+                if content:
+                    cur2.execute("""
+                        INSERT INTO coaching_memory_themes (user_id, theme, content, updated_at)
+                        VALUES (%s,%s,%s,NOW())
+                        ON CONFLICT (user_id, theme) DO UPDATE SET content=EXCLUDED.content, updated_at=NOW()
+                    """, (user['id'], theme_key, content))
+            cur2.close(); conn2.close()
+
+    return {"reply": reply_text}
+
+# ── Coaching Memory (dated log + standing themes) ────────────────────────────
+
+@app.get("/coaching/memory")
+def get_memory(user: dict = Depends(get_current_user)):
+    """View what's currently stored in coaching memory — the dated log and the
+    five standing-pattern threads."""
+    conn = get_db(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT id, entry_date, summary FROM coaching_memory_log WHERE user_id=%s ORDER BY entry_date DESC LIMIT 50", (user['id'],))
+    log = [dict(r) for r in cur.fetchall()]
+    cur.execute("SELECT theme, content, updated_at FROM coaching_memory_themes WHERE user_id=%s", (user['id'],))
+    themes = [dict(r) for r in cur.fetchall()]
+    cur.close(); conn.close()
+    return {"dated_log": log, "themes": themes}
+
+@app.post("/coaching/memory/seed")
+async def seed_memory(text: str = Form(...), user: dict = Depends(get_current_user)):
+    """One-time import: extract dated log entries and standing-pattern updates from
+    historical conversation content (e.g. past coaching sessions elsewhere) and
+    seed them into memory, so the ongoing coach starts from real history instead
+    of zero. Uses the same distillation approach as the ongoing memory updates —
+    this is a retroactive application of it, not a separate mechanism."""
+    if not ANTHROPIC_KEY:
+        raise HTTPException(status_code=503, detail="AI unavailable")
+
+    conn = get_db(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT theme, content FROM coaching_memory_themes WHERE user_id=%s", (user['id'],))
+    existing_themes = {r['theme']: r['content'] for r in cur.fetchall()}
+    cur.close(); conn.close()
+
+    existing_ctx = ""
+    if existing_themes:
+        existing_ctx = "\nEXISTING STANDING PATTERNS (fold new content into these, don't discard):\n"
+        for key, label in MEMORY_THEMES.items():
+            if existing_themes.get(key):
+                existing_ctx += "- " + label + ": " + str(existing_themes[key]) + "\n"
+
+    extract_prompt = (
+        "You are extracting structured coaching memory from historical conversation content "
+        "between a cyclist and their coach. Read the raw content below and extract:\n"
+        "1. Dated log entries — one per distinct ride or dated episode actually discussed, "
+        "2-3 sentences each, distilled from what was said, not verbatim quotes.\n"
+        "2. Updated standing patterns for these five themes, based on everything below "
+        "collectively: hydration_fueling, effort_perception, recovery_readiness, "
+        "environmental_context, life_context. Only include a theme if the content actually "
+        "informs it — leave the rest null.\n"
+        + existing_ctx +
+        "\nOutput ONLY a JSON object, no other text, no markdown fences, shaped exactly like:\n"
+        "{\"dated_entries\": [{\"date\":\"YYYY-MM-DD\",\"summary\":\"...\"}], "
+        "\"theme_updates\": {\"hydration_fueling\":\"...\" or null, \"effort_perception\":\"...\" "
+        "or null, \"recovery_readiness\":\"...\" or null, \"environmental_context\":\"...\" or "
+        "null, \"life_context\":\"...\" or null}}\n\n"
+        "RAW CONTENT:\n" + text[:150000]
+    )
+
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01"},
+                json={"model": "claude-sonnet-4-6", "max_tokens": 3000,
+                      "messages": [{"role": "user", "content": extract_prompt}]},
+                timeout=90
+            )
+            raw = resp.json()['content'][0]['text']
+    except Exception as e:
+        raise HTTPException(status_code=502, detail="Extraction request failed: " + str(e))
+
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        raise HTTPException(status_code=502, detail="Could not parse extraction result as JSON")
+
+    entries = parsed.get('dated_entries') or []
+    theme_updates = parsed.get('theme_updates') or {}
+
+    conn = get_db(); cur = conn.cursor()
+    added = 0
+    for e in entries:
+        if e.get('date') and e.get('summary'):
+            cur.execute(
+                "INSERT INTO coaching_memory_log (user_id, entry_date, summary) VALUES (%s,%s,%s)",
+                (user['id'], e['date'], e['summary'])
+            )
+            added += 1
+    updated_themes = []
+    for theme_key in MEMORY_THEMES:
+        content = theme_updates.get(theme_key)
+        if content:
+            cur.execute("""
+                INSERT INTO coaching_memory_themes (user_id, theme, content, updated_at)
+                VALUES (%s,%s,%s,NOW())
+                ON CONFLICT (user_id, theme) DO UPDATE SET content=EXCLUDED.content, updated_at=NOW()
+            """, (user['id'], theme_key, content))
+            updated_themes.append(theme_key)
+    cur.close(); conn.close()
+
+    return {"status": "seeded", "dated_entries_added": added, "themes_updated": updated_themes}
 
 # ── Strava Integration ───────────────────────────────────────────────────────
 
