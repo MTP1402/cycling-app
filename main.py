@@ -1,11 +1,31 @@
 # ═══════════════════════════════════════════════════════════════════
 # CYCLING COACH API — main.py
 #
-# VERSION: 1.9.1  (2026-07-22)
+# VERSION: 1.9.2  (2026-07-23)
 # Check this against GET / on the live Railway URL before assuming
 # a deploy has actually landed — the two should always match.
 #
 # CHANGELOG
+#   1.9.2 (2026-07-23) — coaching_memory_log had no protection against
+#                         the same date being logged twice — running a
+#                         seed import twice (easy to do by accident)
+#                         produced exact-topic duplicates, 18 dates
+#                         doubled into 36 rows. Added a unique index
+#                         on (user_id, entry_date) with an automatic
+#                         one-time cleanup in init_db() that removes
+#                         pre-existing duplicates (keeping the more
+#                         recent of each pair) before the index locks
+#                         in — self-healing on next deploy, no manual
+#                         cleanup needed. All three places that write
+#                         a dated entry (get_coaching_summary,
+#                         coaching_chat, seed_memory) now upsert on
+#                         that same date instead of blindly inserting,
+#                         so this can't recur going forward — a
+#                         second mention of an already-logged date
+#                         updates that entry rather than duplicating
+#                         it. Themes were already protected this way
+#                         from the start; this brings the dated log
+#                         up to the same standard.
 #   1.9.1 (2026-07-22) — /coaching/memory/seed failed with "Could not
 #                         parse extraction result as JSON" — the model
 #                         wrapped its response in markdown code fences
@@ -230,6 +250,13 @@ def init_db():
             id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id),
             entry_date DATE, summary TEXT, created_at TIMESTAMP DEFAULT NOW()
         );
+        -- Clean up any pre-existing duplicate dates (keep the most recent per
+        -- user+date) before locking in the uniqueness guarantee below. Safe to
+        -- run every startup — a no-op once there's nothing left to dedupe.
+        DELETE FROM coaching_memory_log a USING coaching_memory_log b
+            WHERE a.id < b.id AND a.user_id = b.user_id AND a.entry_date = b.entry_date;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_log_user_date
+            ON coaching_memory_log (user_id, entry_date);
         CREATE TABLE IF NOT EXISTS coaching_memory_themes (
             id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id),
             theme TEXT, content TEXT, updated_at TIMESTAMP DEFAULT NOW(),
@@ -908,10 +935,11 @@ async def get_coaching_summary(user, metrics):
                 conn2 = get_db(); cur2 = conn2.cursor()
                 de = mem_update.get('dated_entry')
                 if de and de.get('date') and de.get('summary'):
-                    cur2.execute(
-                        "INSERT INTO coaching_memory_log (user_id, entry_date, summary) VALUES (%s,%s,%s)",
-                        (user['id'], de['date'], de['summary'])
-                    )
+                    cur2.execute("""
+                        INSERT INTO coaching_memory_log (user_id, entry_date, summary)
+                        VALUES (%s,%s,%s)
+                        ON CONFLICT (user_id, entry_date) DO UPDATE SET summary=EXCLUDED.summary
+                    """, (user['id'], de['date'], de['summary']))
                 tu = mem_update.get('theme_updates') or {}
                 for theme_key in MEMORY_THEMES:
                     content = tu.get(theme_key)
@@ -1442,10 +1470,11 @@ async def coaching_chat(
             conn2 = get_db(); cur2 = conn2.cursor()
             de = mem_update.get('dated_entry')
             if de and de.get('date') and de.get('summary'):
-                cur2.execute(
-                    "INSERT INTO coaching_memory_log (user_id, entry_date, summary) VALUES (%s,%s,%s)",
-                    (user['id'], de['date'], de['summary'])
-                )
+                cur2.execute("""
+                    INSERT INTO coaching_memory_log (user_id, entry_date, summary)
+                    VALUES (%s,%s,%s)
+                    ON CONFLICT (user_id, entry_date) DO UPDATE SET summary=EXCLUDED.summary
+                """, (user['id'], de['date'], de['summary']))
             tu = mem_update.get('theme_updates') or {}
             for theme_key in MEMORY_THEMES:
                 content = tu.get(theme_key)
@@ -1538,10 +1567,11 @@ async def seed_memory(text: str = Form(...), user: dict = Depends(get_current_us
     added = 0
     for e in entries:
         if e.get('date') and e.get('summary'):
-            cur.execute(
-                "INSERT INTO coaching_memory_log (user_id, entry_date, summary) VALUES (%s,%s,%s)",
-                (user['id'], e['date'], e['summary'])
-            )
+            cur.execute("""
+                INSERT INTO coaching_memory_log (user_id, entry_date, summary)
+                VALUES (%s,%s,%s)
+                ON CONFLICT (user_id, entry_date) DO UPDATE SET summary=EXCLUDED.summary
+            """, (user['id'], e['date'], e['summary']))
             added += 1
     updated_themes = []
     for theme_key in MEMORY_THEMES:
