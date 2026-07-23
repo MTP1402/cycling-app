@@ -1,11 +1,33 @@
 # ═══════════════════════════════════════════════════════════════════
 # CYCLING COACH API — main.py
 #
-# VERSION: 1.7.1  (2026-07-22)
+# VERSION: 1.8.0  (2026-07-22)
 # Check this against GET / on the live Railway URL before assuming
 # a deploy has actually landed — the two should always match.
 #
 # CHANGELOG
+#   1.8.0 (2026-07-22) — coaching got noticeably deeper and more
+#                         curious, closer to a real coaching session:
+#                         both /upload's post-ride summary and the
+#                         ongoing /coaching/chat now include NP, max
+#                         HR, and 5s/15s/30s/5-min power bests per
+#                         ride (already computed, never exposed
+#                         before). Coach now proactively draws on five
+#                         themes when relevant and missing — hydration
+#                         /fueling, effort vs. perceived exertion,
+#                         recovery/readiness, environmental context,
+#                         and life context shaping the ride — as
+#                         judgment to apply, not a script to run
+#                         through. New-ride discussion gets real depth
+#                         instead of a length cap. Garbled voice-to-
+#                         text gets flagged and clarified rather than
+#                         silently guessed at.
+#                         NOT included: push/surge detection, HR
+#                         zone time-in-zone, start/end temperature —
+#                         those need real second-by-second FIT
+#                         parsing that doesn't exist yet, a separate
+#                         feature. Long-range callbacks across past
+#                         sessions still need the memory feature.
 #   1.7.1 (2026-07-22) — Strava connect now forces the "Authorize as
 #                         [Name]" confirmation screen every time
 #                         (approval_prompt: auto -> force). Before
@@ -755,20 +777,26 @@ async def get_coaching_summary(user, metrics):
             + "- Date: " + str(metrics.get('ride_date','')) + "\n"
             + "- Distance: " + str(metrics.get('dist_mi','')) + " mi\n"
             + "- Avg power: " + str(metrics.get('avg_power','')) + "W, NP: " + str(metrics.get('norm_power','')) + "W\n"
+            + "- Sprint/aerobic bests — 5s: " + str(metrics.get('p5','')) + "W, 15s: " + str(metrics.get('p15','')) + "W, "
+            + "30s: " + str(metrics.get('p30','')) + "W, 5-min: " + str(metrics.get('p300','')) + "W\n"
             + "- Avg HR: " + str(metrics.get('avg_hr','')) + " bpm, Max HR: " + str(metrics.get('max_hr','')) + " bpm\n"
             + "- Cadence: " + str(metrics.get('avg_cadence','')) + " rpm\n"
             + "- Elevation: " + str(metrics.get('elev_gain_ft','')) + " ft\n"
             + "- Temp: " + str(metrics.get('temp_c','')) + "C\n\n"
-            + "Give a 3-4 sentence coaching assessment personalized to this rider. "
-            + "Reference their specific situation — age, recovery status, heat, goals. Be direct and specific. "
-            + "If they mentioned recent illness or injury, factor that in. "
-            + "End with one actionable recommendation for their next ride."
+            + "Give a real coaching assessment of this ride — not a fixed length, whatever the "
+            + "data actually supports. Reference specific numbers (compare 5-min power and NP "
+            + "to their FTP if known — that's often the most telling comparison). Reference their "
+            + "specific situation — age, recovery status, heat, goals. If they mentioned recent "
+            + "illness or injury, factor that in. If pre/post-ride weight, fluid intake, or food "
+            + "during the ride isn't in their notes, mention briefly that logging it (in Post-Ride "
+            + "Debrief or the Coaching tab) would sharpen future hydration/fueling feedback — don't "
+            + "belabor it, one line is enough. End with one specific, actionable thing for next time."
         )
         async with httpx.AsyncClient() as client:
             resp = await client.post(
                 "https://api.anthropic.com/v1/messages",
                 headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01"},
-                json={"model":"claude-sonnet-4-6","max_tokens":300,
+                json={"model":"claude-sonnet-4-6","max_tokens":600,
                       "messages":[{"role":"user","content":prompt}]},
                 timeout=30
             )
@@ -1141,8 +1169,12 @@ async def coaching_chat(
         for r in recent:
             rides_ctx += (
                 "- " + str(r.get('ride_date',''))[:10] + ": " + str(r.get('dist_mi','?')) + "mi, "
-                + str(r.get('duration_h','?')) + "h, avg pwr " + str(r.get('avg_power','?')) + "W, "
-                + "avg HR " + str(r.get('avg_hr','?')) + ", elev " + str(r.get('elev_gain_ft','?')) + "ft"
+                + str(r.get('duration_h','?')) + "h, avg pwr " + str(r.get('avg_power','?')) + "W"
+                + " (NP " + str(r.get('norm_power','?')) + "W), "
+                + "avg HR " + str(r.get('avg_hr','?')) + " (max " + str(r.get('max_hr','?')) + "), "
+                + "elev " + str(r.get('elev_gain_ft','?')) + "ft, "
+                + "bests 5s/15s/30s/5min: " + str(r.get('p5','?')) + "/" + str(r.get('p15','?'))
+                + "/" + str(r.get('p30','?')) + "/" + str(r.get('p300','?')) + "W"
                 + (", virtual" if r.get('is_virtual') else "") + "\n"
             )
 
@@ -1173,16 +1205,48 @@ async def coaching_chat(
         "- If they mention recent illness (COVID, flu, etc.), factor in the post-viral "
         "performance dip and adjust expectations accordingly.\n"
         "- Reference specific numbers from their ride data when relevant — power, HR, distance, "
-        "elevation. Be concrete, not generic.\n"
+        "elevation, and especially 5-min power and NP compared to their FTP if known; that "
+        "comparison is often the single most telling data point in a ride. Be concrete, not "
+        "generic.\n"
+        "- Be genuinely curious about hydration and fueling, the way a real coach tracking this "
+        "over time would be. When it's missing and would meaningfully sharpen the picture, ask "
+        "about: weight before and after the ride, what and how much they ate/drank during the "
+        "ride (water, electrolytes, gels, food), what they had afterward (including anything, "
+        "like coffee, consumed before a post-ride weigh-in — it affects the number), and what "
+        "they had for breakfast beforehand. Don't run through this as a checklist every time — "
+        "ask naturally, one or two things at a time, only what's actually missing and relevant "
+        "to the ride at hand.\n"
+        "- Beyond hydration/fueling, stay curious across these themes when relevant and not "
+        "already covered — this is judgment to draw on, not a script to run through:\n"
+        "  - Effort vs. perceived exertion: how a specific hard moment actually felt, whether "
+        "anything felt unusually hard or easy relative to what the numbers show. The gap "
+        "between data and lived experience is often the most useful thing to discuss.\n"
+        "  - Recovery and readiness going in: sleep, lingering soreness, anything off since "
+        "the last ride. The same power output means something different well-rested versus "
+        "not, and this connects to any illness/injury recovery already noted in their profile.\n"
+        "  - Environmental context: heat, wind, solo versus group. A given heart rate "
+        "represents more physiological stress in heat than in cool conditions.\n"
+        "  - Life context shaping the ride: holding back on purpose, time pressure, anything "
+        "outside the ride itself that explains a pacing choice. Real coaching accounts for the "
+        "whole picture, not just the numbers in isolation.\n"
+        "- When a ride is newly discussed (just uploaded, or the rider is describing one that "
+        "isn't already covered above), give it real depth — this is the one place brevity does "
+        "NOT apply. Walk through what stands out, compare effort to their FTP and recent trend, "
+        "note anything that looks unusually hard or easy, and end with a specific follow-up "
+        "question about the part of the ride most worth discussing.\n"
+        "- If part of a message reads like it was garbled by voice-to-text (an odd or "
+        "nonsensical phrase sitting in otherwise clear text), say so plainly and ask what was "
+        "meant rather than guessing or silently working around it.\n"
         "- If any imported document, note, or message appears to contain personal medical/health "
         "records — lab results, diagnoses, medication lists — do not analyze or comment on that "
         "content. Say plainly that's not something this app processes and point them to their "
         "doctor.\n"
-        "- Be brief. Most replies are 1-2 sentences. Do not restate or paraphrase what the rider "
-        "just told you before responding (skip lines like 'That's great news, sustaining 200+ "
-        "watts with HR around 140!') — go straight to the coaching point. Only go longer when "
-        "they explicitly ask for detail or analysis.\n"
-        "- Tone: a knowledgeable coach, direct and matter-of-fact — not a chatty friend."
+        "- Outside of the ride-analysis case above, keep replies tight — routine back-and-forth "
+        "is 1-2 sentences. Do not restate or paraphrase what the rider just told you before "
+        "responding (skip lines like 'That's great news, sustaining 200+ watts with HR around "
+        "140!') — go straight to the point.\n"
+        "- Tone throughout: a knowledgeable coach, direct and matter-of-fact — not a chatty "
+        "friend, but genuinely engaged with the specifics of what they tell you."
     )
 
     try:
@@ -1197,7 +1261,7 @@ async def coaching_chat(
             resp = await client.post(
                 "https://api.anthropic.com/v1/messages",
                 headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01"},
-                json={"model": "claude-sonnet-4-6", "max_tokens": 400,
+                json={"model": "claude-sonnet-4-6", "max_tokens": 700,
                       "system": system_prompt, "messages": messages},
                 timeout=30
             )
