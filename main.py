@@ -1,11 +1,20 @@
 # ═══════════════════════════════════════════════════════════════════
 # CYCLING COACH API — main.py
 #
-# VERSION: 1.9.2  (2026-07-23)
+# VERSION: 1.9.3  (2026-07-23)
 # Check this against GET / on the live Railway URL before assuming
 # a deploy has actually landed — the two should always match.
 #
 # CHANGELOG
+#   1.9.3 (2026-07-23) — added PATCH /coaching/memory/log/{id} (fix a
+#                         wrong date or summary on an existing dated
+#                         entry) and DELETE /coaching/memory/log/{id}
+#                         — there was no way to correct or remove a
+#                         bad entry before this. Immediate use case:
+#                         a seeded entry got dated from a raw UTC
+#                         conversation timestamp without converting to
+#                         local time, landing it a day off from the
+#                         actual ride.
 #   1.9.2 (2026-07-23) — coaching_memory_log had no protection against
 #                         the same date being logged twice — running a
 #                         seed import twice (easy to do by accident)
@@ -1501,6 +1510,43 @@ def get_memory(user: dict = Depends(get_current_user)):
     themes = [dict(r) for r in cur.fetchall()]
     cur.close(); conn.close()
     return {"dated_log": log, "themes": themes}
+
+@app.patch("/coaching/memory/log/{entry_id}")
+def edit_memory_log_entry(
+    entry_id: int,
+    entry_date: str = Form(default=None),
+    summary: str = Form(default=None),
+    user: dict = Depends(get_current_user)
+):
+    """Fix a dated log entry — e.g. a wrong date from a timezone slip during
+    import. Only the fields provided are changed; the other stays as-is."""
+    if not entry_date and not summary:
+        raise HTTPException(status_code=400, detail="Provide entry_date and/or summary to update")
+    conn = get_db(); cur = conn.cursor()
+    cur.execute("SELECT id FROM coaching_memory_log WHERE id=%s AND user_id=%s", (entry_id, user['id']))
+    if not cur.fetchone():
+        cur.close(); conn.close()
+        raise HTTPException(status_code=404, detail="Entry not found")
+    try:
+        if entry_date:
+            cur.execute("UPDATE coaching_memory_log SET entry_date=%s WHERE id=%s", (entry_date, entry_id))
+        if summary:
+            cur.execute("UPDATE coaching_memory_log SET summary=%s WHERE id=%s", (summary, entry_id))
+    except psycopg2.errors.UniqueViolation:
+        conn.rollback(); cur.close(); conn.close()
+        raise HTTPException(status_code=409, detail="Another entry already exists for that date — delete or edit that one first")
+    cur.close(); conn.close()
+    return {"status": "updated", "id": entry_id}
+
+@app.delete("/coaching/memory/log/{entry_id}")
+def delete_memory_log_entry(entry_id: int, user: dict = Depends(get_current_user)):
+    conn = get_db(); cur = conn.cursor()
+    cur.execute("DELETE FROM coaching_memory_log WHERE id=%s AND user_id=%s", (entry_id, user['id']))
+    deleted = cur.rowcount
+    cur.close(); conn.close()
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Entry not found")
+    return {"status": "deleted"}
 
 @app.post("/coaching/memory/seed")
 async def seed_memory(text: str = Form(...), user: dict = Depends(get_current_user)):
