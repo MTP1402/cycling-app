@@ -1,11 +1,20 @@
 # ═══════════════════════════════════════════════════════════════════
 # CYCLING COACH API — main.py
 #
-# VERSION: 1.7.0  (2026-07-19)
+# VERSION: 1.7.1  (2026-07-22)
 # Check this against GET / on the live Railway URL before assuming
 # a deploy has actually landed — the two should always match.
 #
 # CHANGELOG
+#   1.7.1 (2026-07-22) — Strava connect now forces the "Authorize as
+#                         [Name]" confirmation screen every time
+#                         (approval_prompt: auto -> force). Before
+#                         this, if a browser already had a live
+#                         Strava session, connecting silently reused
+#                         it with no confirmation — risky on a shared
+#                         or borrowed device. Now beta testers always
+#                         see and confirm which Strava account is
+#                         being connected.
 #   1.7.0 (2026-07-19) — added 5-minute best power (p300), computed
 #                         the same way as the existing 5s/15s/30s
 #                         bests. New DB column, captured on both FIT
@@ -1252,7 +1261,7 @@ def strava_connect(_auth: str = ""):
         "client_id":       STRAVA_CLIENT_ID,
         "redirect_uri":    STRAVA_REDIRECT_URI,
         "response_type":   "code",
-        "approval_prompt": "auto",
+        "approval_prompt": "force",
         "scope":           "activity:read_all",
         "state":           _auth
     }
