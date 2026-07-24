@@ -1,11 +1,23 @@
 # ═══════════════════════════════════════════════════════════════════
 # CYCLING COACH API — main.py
 #
-# VERSION: 2.0.0  (2026-07-23)
+# VERSION: 2.0.1  (2026-07-23)
 # Check this against GET / on the live Railway URL before assuming
 # a deploy has actually landed — the two should always match.
 #
 # CHANGELOG
+#   2.0.1 (2026-07-23) — the new fields from 2.0.0 (L/R balance,
+#                         elevation loss, calories, TSS/IF) were being
+#                         computed and stored correctly but never
+#                         actually threaded into what the AI sees —
+#                         same class of gap as the 5-min-power miss
+#                         from earlier today. Added to both the
+#                         post-upload coaching summary and the ongoing
+#                         coaching chat's recent-rides context (shown
+#                         only when actually present, since most rides
+#                         won't have L/R balance). Also fixed elevation
+#                         loss printing as "-None ft" when a ride has
+#                         no descent data rather than omitting it.
 #   2.0.0 (2026-07-23) — RIDE DATA ARCHITECTURE, part 1 of the plan
 #                         in Ride_Data_Architecture_Plan.md. Both FIT
 #                         upload and Strava sync already read every
@@ -994,7 +1006,10 @@ async def get_coaching_summary(user, metrics):
             + "30s: " + str(metrics.get('p30','')) + "W, 5-min: " + str(metrics.get('p300','')) + "W\n"
             + "- Avg HR: " + str(metrics.get('avg_hr','')) + " bpm, Max HR: " + str(metrics.get('max_hr','')) + " bpm\n"
             + "- Cadence: " + str(metrics.get('avg_cadence','')) + " rpm\n"
-            + "- Elevation: " + str(metrics.get('elev_gain_ft','')) + " ft\n"
+            + "- Elevation: +" + str(metrics.get('elev_gain_ft','?')) + " ft" + (" / -" + str(metrics.get('elev_loss_ft')) + " ft" if metrics.get('elev_loss_ft') is not None else "") + "\n"
+            + ("- Left/right power balance: " + str(metrics.get('avg_lr_balance')) + "% right\n" if metrics.get('avg_lr_balance') is not None else "")
+            + ("- Training stress score: " + str(metrics.get('training_stress_score')) + ", Intensity factor: " + str(metrics.get('intensity_factor')) + "\n" if metrics.get('training_stress_score') else "")
+            + ("- Calories: " + str(metrics.get('calories')) + "\n" if metrics.get('calories') else "")
             + "- Temp: " + str(metrics.get('temp_c','')) + "C\n\n"
             + "Give a real coaching assessment of this ride — not a fixed length, whatever the "
             + "data actually supports. Reference specific numbers (compare 5-min power and NP "
@@ -1442,6 +1457,7 @@ async def coaching_chat(
                 + "elev " + str(r.get('elev_gain_ft','?')) + "ft, "
                 + "bests 5s/15s/30s/5min: " + str(r.get('p5','?')) + "/" + str(r.get('p15','?'))
                 + "/" + str(r.get('p30','?')) + "/" + str(r.get('p300','?')) + "W"
+                + (", L/R balance " + str(r.get('avg_lr_balance')) + "% right" if r.get('avg_lr_balance') is not None else "")
                 + (", virtual" if r.get('is_virtual') else "") + "\n"
             )
 
