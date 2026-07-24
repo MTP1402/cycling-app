@@ -1,11 +1,44 @@
 # ═══════════════════════════════════════════════════════════════════
 # CYCLING COACH API — main.py
 #
-# VERSION: 1.9.4  (2026-07-23)
+# VERSION: 2.0.0  (2026-07-23)
 # Check this against GET / on the live Railway URL before assuming
 # a deploy has actually landed — the two should always match.
 #
 # CHANGELOG
+#   2.0.0 (2026-07-23) — RIDE DATA ARCHITECTURE, part 1 of the plan
+#                         in Ride_Data_Architecture_Plan.md. Both FIT
+#                         upload and Strava sync already read every
+#                         data point in a ride to compute averages —
+#                         they just threw the raw points away
+#                         afterward. Now the raw per-second streams
+#                         (power, HR, cadence, altitude, distance,
+#                         speed, left-right balance where available)
+#                         are kept in a new ride_streams table, not
+#                         discarded. This is the foundation everything
+#                         else in the plan depends on — nothing
+#                         displayed differently yet, but the data now
+#                         exists to build on. Also: elevation LOSS is
+#                         now tracked alongside gain (wasn't before);
+#                         calories, avg left-right balance, and
+#                         device-reported TSS/intensity factor are
+#                         captured where present; enhanced_altitude/
+#                         enhanced_speed are preferred over the plain
+#                         FIT fields when both exist (more precise,
+#                         same underlying data). Left-right balance,
+#                         torque effectiveness, and pedal smoothness
+#                         are FIT-upload-only — Strava's public API
+#                         doesn't expose those as streams, so Strava-
+#                         synced rides won't have them regardless of
+#                         what the original device recorded.
+#                         Tested before shipping: enhanced-field
+#                         preference, elevation gain/loss split, and
+#                         stream-building logic verified against
+#                         controlled fake data; JSONB serialization
+#                         confirmed round-trips cleanly; dashboard
+#                         re-rendered against both old- and new-shape
+#                         ride records to confirm nothing broke for
+#                         existing data.
 #   1.9.4 (2026-07-23) — the new edit-log-entry endpoint used PATCH,
 #                         and PowerShell's Invoke-RestMethod doesn't
 #                         reliably form-encode a hashtable body for
@@ -280,11 +313,22 @@ def init_db():
             theme TEXT, content TEXT, updated_at TIMESTAMP DEFAULT NOW(),
             UNIQUE(user_id, theme)
         );
+        CREATE TABLE IF NOT EXISTS ride_streams (
+            id SERIAL PRIMARY KEY,
+            ride_id INTEGER UNIQUE REFERENCES rides(id) ON DELETE CASCADE,
+            streams JSONB,
+            created_at TIMESTAMP DEFAULT NOW()
+        );
         -- Add missing columns if upgrading from old schema
         ALTER TABLE rides ADD COLUMN IF NOT EXISTS elev_gain_ft FLOAT;
         ALTER TABLE rides ADD COLUMN IF NOT EXISTS ride_type TEXT DEFAULT 'General';
         ALTER TABLE rides ADD COLUMN IF NOT EXISTS is_virtual BOOLEAN DEFAULT FALSE;
         ALTER TABLE rides ADD COLUMN IF NOT EXISTS p300 INTEGER;
+        ALTER TABLE rides ADD COLUMN IF NOT EXISTS elev_loss_ft FLOAT;
+        ALTER TABLE rides ADD COLUMN IF NOT EXISTS calories INTEGER;
+        ALTER TABLE rides ADD COLUMN IF NOT EXISTS avg_lr_balance FLOAT;
+        ALTER TABLE rides ADD COLUMN IF NOT EXISTS training_stress_score FLOAT;
+        ALTER TABLE rides ADD COLUMN IF NOT EXISTS intensity_factor FLOAT;
     """)
     cur.close(); conn.close()
 
@@ -338,9 +382,20 @@ def parse_fit_bytes(data):
                 records.append(r)
         os.unlink(tmp_path)
 
+        # Prefer the "enhanced" altitude/speed fields when present — same
+        # data, wider range and finer precision than the plain fields.
+        def _alt(r):
+            v = r.get('enhanced_altitude')
+            return v if v is not None else r.get('altitude')
+        def _spd(r):
+            v = r.get('enhanced_speed')
+            return v if v is not None else r.get('speed')
+        def _ts(v):
+            return v.isoformat() if hasattr(v, 'isoformat') else v
+
         powers   = [r['power']      for r in records if r.get('power')      and r['power'] > 0]
         cadences = [r['cadence']    for r in records if r.get('cadence')]
-        alts     = [r['altitude']   for r in records if r.get('altitude')]
+        alts     = [_alt(r) for r in records if _alt(r) is not None]
 
         def best_avg(vals, n):
             if not vals or len(vals) < n: return max(vals) if vals else None
@@ -351,14 +406,39 @@ def parse_fit_bytes(data):
             smoothed = [sum(powers[max(0,i-29):i+1])/len(powers[max(0,i-29):i+1]) for i in range(len(powers))]
             np_val = round((sum(x**4 for x in smoothed)/len(smoothed))**0.25)
 
-        # Elevation gain from altitude records
-        elev_gain_m = 0.0
+        # Elevation gain AND loss from altitude records (loss wasn't
+        # captured before — descent matters for anywhere with real climbing)
+        elev_gain_m = 0.0; elev_loss_m = 0.0
         if alts and len(alts) > 1:
             for i in range(1, len(alts)):
                 diff = alts[i] - alts[i-1]
-                if diff > 0:
-                    elev_gain_m += diff
+                if diff > 0: elev_gain_m += diff
+                elif diff < 0: elev_loss_m += -diff
         elev_gain_ft = round(elev_gain_m * 3.28084, 0) if elev_gain_m else None
+        elev_loss_ft = round(elev_loss_m * 3.28084, 0) if elev_loss_m else None
+
+        # Raw per-second streams — kept instead of discarded after the
+        # aggregates above are computed, so future tools/charts/AI queries
+        # have something to work with. left_right_balance and the torque/
+        # smoothness fields are included defensively — present only if the
+        # power meter and head unit combination actually supports them.
+        streams = {
+            'timestamp':            [_ts(r.get('timestamp')) for r in records],
+            'distance':              [r.get('distance') for r in records],
+            'altitude':              [_alt(r) for r in records],
+            'speed':                 [_spd(r) for r in records],
+            'power':                 [r.get('power') for r in records],
+            'heart_rate':            [r.get('heart_rate') for r in records],
+            'cadence':               [r.get('cadence') for r in records],
+            'left_right_balance':    [r.get('left_right_balance') for r in records],
+            'left_torque_eff':       [r.get('left_torque_effectiveness') for r in records],
+            'right_torque_eff':      [r.get('right_torque_effectiveness') for r in records],
+            'left_pedal_smooth':     [r.get('left_pedal_smoothness') for r in records],
+            'right_pedal_smooth':    [r.get('right_pedal_smoothness') for r in records],
+        }
+        # Session-level L/R balance average, if the field is present anywhere
+        lr_vals = [v for v in streams['left_right_balance'] if v is not None]
+        avg_lr_balance = round(sum(lr_vals) / len(lr_vals), 1) if lr_vals else None
 
         start   = session.get('start_time')
         dist    = session.get('total_distance')
@@ -399,9 +479,15 @@ def parse_fit_bytes(data):
             'p30':  best_avg(powers, 30),
             'p300': best_avg(powers, 300),
             'elev_gain_ft': elev_gain_ft,
+            'elev_loss_ft': elev_loss_ft,
+            'calories':     session.get('total_calories'),
+            'avg_lr_balance': avg_lr_balance,
+            'training_stress_score': session.get('training_stress_score'),
+            'intensity_factor':      session.get('intensity_factor'),
             'ride_type':   ride_type,
             'is_virtual':  is_virtual,
             'temp_c':      session.get('avg_temperature'),
+            'streams':     streams,
         }
     except Exception as e:
         raise HTTPException(status_code=400, detail="Could not parse FIT file: " + str(e))
@@ -1008,6 +1094,7 @@ async def upload_fit(file: UploadFile = File(...), notes: str = Form(default="")
                      user: dict = Depends(get_current_user)):
     data    = await file.read()
     metrics = parse_fit_bytes(data)
+    streams = metrics.pop('streams', None)  # keep out of the API response — big, browser doesn't need it
     conn = get_db(); cur = conn.cursor()
     # Deduplication check
     cur.execute("""SELECT id FROM rides WHERE user_id=%s
@@ -1020,17 +1107,24 @@ async def upload_fit(file: UploadFile = File(...), notes: str = Form(default="")
         return {"ride_id": existing[0], "metrics": metrics, "coaching": "Already in your database.", "duplicate": True}
     cur.execute("""INSERT INTO rides (user_id,ride_date,name,dist_mi,duration_h,
         avg_power,norm_power,avg_hr,max_hr,avg_cadence,max_cadence,
-        p5,p15,p30,p300,elev_gain_ft,ride_type,is_virtual,temp_c,notes)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+        p5,p15,p30,p300,elev_gain_ft,elev_loss_ft,calories,avg_lr_balance,
+        training_stress_score,intensity_factor,ride_type,is_virtual,temp_c,notes)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
         (user['id'], metrics['ride_date'], metrics.get('name'),
          metrics.get('dist_mi'), metrics.get('duration_h'),
          metrics.get('avg_power'), metrics.get('norm_power'),
          metrics.get('avg_hr'), metrics.get('max_hr'),
          metrics.get('avg_cadence'), metrics.get('max_cadence'),
          metrics.get('p5'), metrics.get('p15'), metrics.get('p30'), metrics.get('p300'),
-         metrics.get('elev_gain_ft'), metrics.get('ride_type','General'),
+         metrics.get('elev_gain_ft'), metrics.get('elev_loss_ft'), metrics.get('calories'),
+         metrics.get('avg_lr_balance'), metrics.get('training_stress_score'),
+         metrics.get('intensity_factor'), metrics.get('ride_type','General'),
          metrics.get('is_virtual', False), metrics.get('temp_c'), notes))
-    ride_id = cur.fetchone()[0]; cur.close(); conn.close()
+    ride_id = cur.fetchone()[0]
+    if streams:
+        cur.execute("INSERT INTO ride_streams (ride_id, streams) VALUES (%s,%s)",
+                    (ride_id, psycopg2.extras.Json(streams)))
+    cur.close(); conn.close()
     coaching = await get_coaching_summary(user, metrics)
     return {"ride_id": ride_id, "metrics": metrics, "coaching": coaching}
 
@@ -1834,16 +1928,21 @@ async def strava_sync(
                     if cur3.fetchone():
                         cur3.close(); skipped += 1; continue
 
-                    # Get stream data for power/HR/cadence
+                    # Get stream data for power/HR/cadence/distance/time.
+                    # Strava's public API doesn't expose left-right balance,
+                    # torque effectiveness, or pedal smoothness as streams —
+                    # those fields stay NULL for Strava-sourced rides; only
+                    # direct FIT uploads from a supporting power meter can
+                    # capture them.
                     stream_resp = await client.get(
                         f"https://www.strava.com/api/v3/activities/{act['id']}/streams",
                         headers={"Authorization": "Bearer " + access_token},
-                        params={"keys": "watts,heartrate,cadence,altitude", "key_by_type": "true"}
+                        params={"keys": "watts,heartrate,cadence,altitude,distance,time,velocity_smooth", "key_by_type": "true"}
                     )
-                    streams = stream_resp.json()
+                    raw_streams = stream_resp.json()
 
                     def stream_vals(key):
-                        s = streams.get(key,{})
+                        s = raw_streams.get(key,{})
                         return s.get('data',[]) if isinstance(s, dict) else []
 
                     powers   = [v for v in stream_vals('watts')     if v and v > 0]
@@ -1860,12 +1959,14 @@ async def strava_sync(
                         sm = [sum(powers[max(0,i-29):i+1])/len(powers[max(0,i-29):i+1]) for i in range(len(powers))]
                         np_val = round((sum(x**4 for x in sm)/len(sm))**0.25)
 
-                    elev_ft = 0.0
+                    elev_gain_m = 0.0; elev_loss_m = 0.0
                     if alts and len(alts) > 1:
                         for i in range(1, len(alts)):
                             d = alts[i] - alts[i-1]
-                            if d > 0: elev_ft += d
-                    elev_ft = round(elev_ft * 3.28084) if elev_ft else (round((act.get('total_elevation_gain') or 0) * 3.28084))
+                            if d > 0: elev_gain_m += d
+                            elif d < 0: elev_loss_m += -d
+                    elev_ft = round(elev_gain_m * 3.28084) if elev_gain_m else (round((act.get('total_elevation_gain') or 0) * 3.28084))
+                    elev_loss_ft = round(elev_loss_m * 3.28084) if elev_loss_m else None
 
                     avg_power = round(sum(powers)/len(powers)) if powers else None
                     avg_hr    = round(sum(hrs)/len(hrs)) if hrs else None
@@ -1875,15 +1976,32 @@ async def strava_sync(
 
                     cur3.execute("""INSERT INTO rides (user_id,ride_date,name,dist_mi,duration_h,
                         avg_power,norm_power,avg_hr,max_hr,avg_cadence,max_cadence,
-                        p5,p15,p30,p300,elev_gain_ft,ride_type,is_virtual,temp_c,notes)
-                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                        p5,p15,p30,p300,elev_gain_ft,elev_loss_ft,calories,ride_type,is_virtual,temp_c,notes)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
                         (user['id'], act_date, act.get('name','Activity'),
                          dist_mi, dur_h, avg_power, np_val,
                          avg_hr, act.get('max_heartrate'),
                          avg_cad, max(cads) if cads else None,
                          best_avg(powers,5), best_avg(powers,15), best_avg(powers,30), best_avg(powers,300),
-                         elev_ft, ride_type, is_virt,
+                         elev_ft, elev_loss_ft, act.get('calories'), ride_type, is_virt,
                          act.get('average_temp'), None))
+                    new_ride_id = cur3.fetchone()[0]
+
+                    # Keep the raw streams instead of discarding them —
+                    # time is stored as seconds-from-start (Strava's native
+                    # format), not absolute timestamps like the FIT path.
+                    stream_data = {
+                        'time_offset_s': stream_vals('time'),
+                        'distance':      stream_vals('distance'),
+                        'altitude':      alts,
+                        'speed':         stream_vals('velocity_smooth'),
+                        'power':         stream_vals('watts'),
+                        'heart_rate':    stream_vals('heartrate'),
+                        'cadence':       stream_vals('cadence'),
+                    }
+                    if any(stream_data.values()):
+                        cur3.execute("INSERT INTO ride_streams (ride_id, streams) VALUES (%s,%s)",
+                                    (new_ride_id, psycopg2.extras.Json(stream_data)))
                     cur3.close()
                     imported += 1
                 except Exception as e:
