@@ -1,11 +1,30 @@
 # ═══════════════════════════════════════════════════════════════════
 # CYCLING COACH API — main.py
 #
-# VERSION: 2.0.1  (2026-07-23)
+# VERSION: 2.1.0  (2026-07-24)
 # Check this against GET / on the live Railway URL before assuming
 # a deploy has actually landed — the two should always match.
 #
 # CHANGELOG
+#   2.1.0 (2026-07-24) — fixed the FIT-vs-Strava methodology mismatch
+#                         found while testing (rides 874/1071, same
+#                         ride, 90W vs 177W avg power and a 32-min
+#                         duration gap). FIT uploads now use moving
+#                         time (total_timer_time) as the primary
+#                         duration, matching Strava sync's existing
+#                         convention, with a fallback to elapsed time
+#                         if a device doesn't report timer time.
+#                         Elapsed time is kept as a new separate field
+#                         (elapsed_h) on both paths rather than
+#                         discarded, so stoppage time stays
+#                         recoverable. avg_power on the FIT path is
+#                         now computed from actual non-zero readings,
+#                         same as Strava, instead of trusting the
+#                         device's own session-level average (which
+#                         includes coasting). Also added DELETE
+#                         /rides/{id} — there was previously no way
+#                         to remove a single bad ride, only the
+#                         all-or-nothing /rides/clear.
 #   2.0.1 (2026-07-23) — the new fields from 2.0.0 (L/R balance,
 #                         elevation loss, calories, TSS/IF) were being
 #                         computed and stored correctly but never
@@ -341,6 +360,7 @@ def init_db():
         ALTER TABLE rides ADD COLUMN IF NOT EXISTS avg_lr_balance FLOAT;
         ALTER TABLE rides ADD COLUMN IF NOT EXISTS training_stress_score FLOAT;
         ALTER TABLE rides ADD COLUMN IF NOT EXISTS intensity_factor FLOAT;
+        ALTER TABLE rides ADD COLUMN IF NOT EXISTS elapsed_h FLOAT;
     """)
     cur.close(); conn.close()
 
@@ -454,7 +474,13 @@ def parse_fit_bytes(data):
 
         start   = session.get('start_time')
         dist    = session.get('total_distance')
-        elapsed = session.get('total_elapsed_time')
+        # Moving time (auto-pause excluded) as the primary duration — matches
+        # Strava sync's convention (moving_time), so a ride's numbers don't
+        # depend on which path it came in through. Elapsed time (full wall-
+        # clock, stops included) is kept as a separate field rather than
+        # discarded, so stoppage time is always recoverable if it matters.
+        moving_seconds  = session.get('total_timer_time')
+        elapsed_seconds = session.get('total_elapsed_time')
         sport      = str(session.get('sport', '')).lower()
         sub_sport  = str(session.get('sub_sport', '')).lower()
         # Check file_id for manufacturer (Zwift shows as manufacturer=zwift)
@@ -471,8 +497,14 @@ def parse_fit_bytes(data):
         )
 
         dist_mi   = round(dist/1609.34, 2) if dist else None
-        duration_h = round(elapsed/3600, 2) if elapsed else None
-        avg_power_val = session.get('avg_power')
+        # Fall back to elapsed time if a device doesn't report timer time —
+        # better an approximate duration than none at all.
+        duration_h = round((moving_seconds or elapsed_seconds)/3600, 2) if (moving_seconds or elapsed_seconds) else None
+        elapsed_h  = round(elapsed_seconds/3600, 2) if elapsed_seconds else None
+        # Computed from actual non-zero readings, same as the Strava path —
+        # not the device's own session-level average, which includes
+        # coasting and made this number disagree with Strava-synced rides.
+        avg_power_val = round(sum(powers)/len(powers)) if powers else None
         ride_type = classify_ride(dist_mi, duration_h, avg_power_val, is_virtual)
 
         return {
@@ -492,6 +524,7 @@ def parse_fit_bytes(data):
             'p300': best_avg(powers, 300),
             'elev_gain_ft': elev_gain_ft,
             'elev_loss_ft': elev_loss_ft,
+            'elapsed_h':    elapsed_h,
             'calories':     session.get('total_calories'),
             'avg_lr_balance': avg_lr_balance,
             'training_stress_score': session.get('training_stress_score'),
@@ -1123,8 +1156,8 @@ async def upload_fit(file: UploadFile = File(...), notes: str = Form(default="")
     cur.execute("""INSERT INTO rides (user_id,ride_date,name,dist_mi,duration_h,
         avg_power,norm_power,avg_hr,max_hr,avg_cadence,max_cadence,
         p5,p15,p30,p300,elev_gain_ft,elev_loss_ft,calories,avg_lr_balance,
-        training_stress_score,intensity_factor,ride_type,is_virtual,temp_c,notes)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+        training_stress_score,intensity_factor,elapsed_h,ride_type,is_virtual,temp_c,notes)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
         (user['id'], metrics['ride_date'], metrics.get('name'),
          metrics.get('dist_mi'), metrics.get('duration_h'),
          metrics.get('avg_power'), metrics.get('norm_power'),
@@ -1133,7 +1166,7 @@ async def upload_fit(file: UploadFile = File(...), notes: str = Form(default="")
          metrics.get('p5'), metrics.get('p15'), metrics.get('p30'), metrics.get('p300'),
          metrics.get('elev_gain_ft'), metrics.get('elev_loss_ft'), metrics.get('calories'),
          metrics.get('avg_lr_balance'), metrics.get('training_stress_score'),
-         metrics.get('intensity_factor'), metrics.get('ride_type','General'),
+         metrics.get('intensity_factor'), metrics.get('elapsed_h'), metrics.get('ride_type','General'),
          metrics.get('is_virtual', False), metrics.get('temp_c'), notes))
     ride_id = cur.fetchone()[0]
     if streams:
@@ -1932,6 +1965,7 @@ async def strava_sync(
                         continue
                     dist_mi  = round((act.get('distance') or 0) / 1609.34, 2)
                     dur_h    = round((act.get('moving_time') or 0) / 3600, 2)
+                    elapsed_h = round((act.get('elapsed_time') or 0) / 3600, 2) if act.get('elapsed_time') else None
                     sport    = act.get('sport_type','').lower()
                     is_virt  = act.get('trainer', False) or 'virtual' in sport or 'zwift' in (act.get('name','') or '').lower()
 
@@ -1992,14 +2026,14 @@ async def strava_sync(
 
                     cur3.execute("""INSERT INTO rides (user_id,ride_date,name,dist_mi,duration_h,
                         avg_power,norm_power,avg_hr,max_hr,avg_cadence,max_cadence,
-                        p5,p15,p30,p300,elev_gain_ft,elev_loss_ft,calories,ride_type,is_virtual,temp_c,notes)
-                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                        p5,p15,p30,p300,elev_gain_ft,elev_loss_ft,calories,elapsed_h,ride_type,is_virtual,temp_c,notes)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
                         (user['id'], act_date, act.get('name','Activity'),
                          dist_mi, dur_h, avg_power, np_val,
                          avg_hr, act.get('max_heartrate'),
                          avg_cad, max(cads) if cads else None,
                          best_avg(powers,5), best_avg(powers,15), best_avg(powers,30), best_avg(powers,300),
-                         elev_ft, elev_loss_ft, act.get('calories'), ride_type, is_virt,
+                         elev_ft, elev_loss_ft, act.get('calories'), elapsed_h, ride_type, is_virt,
                          act.get('average_temp'), None))
                     new_ride_id = cur3.fetchone()[0]
 
@@ -2041,6 +2075,18 @@ def clear_rides(user: dict = Depends(get_current_user)):
     cur.execute("DELETE FROM rides WHERE user_id=%s", (user['id'],))
     cur.close(); conn.close()
     return {"status": "all rides cleared"}
+
+@app.delete("/rides/{ride_id}")
+def delete_ride(ride_id: int, user: dict = Depends(get_current_user)):
+    """Delete a single ride. ride_streams cleans up automatically
+    (ON DELETE CASCADE) since it's keyed off ride_id."""
+    conn = get_db(); cur = conn.cursor()
+    cur.execute("DELETE FROM rides WHERE id=%s AND user_id=%s", (ride_id, user['id']))
+    deleted = cur.rowcount
+    cur.close(); conn.close()
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Ride not found")
+    return {"status": "deleted", "id": ride_id}
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def get_dashboard(user: dict = Depends(get_current_user)):
