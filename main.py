@@ -1,11 +1,20 @@
 # ═══════════════════════════════════════════════════════════════════
 # CYCLING COACH API — main.py
 #
-# VERSION: 2.1.0  (2026-07-24)
+# VERSION: 2.1.1  (2026-07-26)
 # Check this against GET / on the live Railway URL before assuming
 # a deploy has actually landed — the two should always match.
 #
 # CHANGELOG
+#   2.1.1 (2026-07-26) — added a dedicated /health endpoint, separate
+#                         from / (which doubles as the version-check
+#                         endpoint). Testing whether that overlap is
+#                         related to the persistent stale-version-
+#                         serving issue that's outlasted CDN checks,
+#                         a manual restart, and two full redeploys.
+#                         railway.json's healthcheckPath needs to be
+#                         updated to /health to match — not just this
+#                         file — for this test to mean anything.
 #   2.1.0 (2026-07-24) — fixed the FIT-vs-Strava methodology mismatch
 #                         found while testing (rides 874/1071, same
 #                         ride, 90W vs 177W avg power and a 32-min
@@ -1114,6 +1123,14 @@ def startup():
 @app.get("/")
 def root():
     return {"status": "Cycling Coach API running", "version": APP_VERSION}
+
+@app.get("/health")
+def health():
+    """Dedicated healthcheck endpoint, separate from / (which is also used
+    to verify the deployed version). Testing whether that overlap is
+    related to the stale-version-serving issue — see Railway support
+    thread and station.railway.com discussion for context."""
+    return {"status": "ok"}
 
 @app.post("/register")
 def register(email: str = Form(...), name: str = Form(...), password: str = Form(...)):
