@@ -1,11 +1,106 @@
 # ═══════════════════════════════════════════════════════════════════
 # CYCLING COACH API — main.py
 #
-# VERSION: 2.1.1  (2026-07-26)
+# VERSION: 2.3.1  (2026-07-27)
 # Check this against GET / on the live Railway URL before assuming
 # a deploy has actually landed — the two should always match.
 #
 # CHANGELOG
+#   2.3.1 (2026-07-27) — fixed the Sprint & Aerobic Power chart's
+#                         tooltip order — it was showing 5-min at the
+#                         top and 30s at the bottom (an explicit
+#                         reversed sort, not just dataset order),
+#                         backwards from the logical 5s/15s/30s/5-min
+#                         reading order. Scoped precisely to this one
+#                         chart — three other charts use the same
+#                         generic reversed-sort pattern for unrelated
+#                         reasons and were deliberately left untouched.
+#   2.3.0 (2026-07-27) — first version of the ride-detail page (step 6
+#                         of the ride data plan) — deliberately scoped
+#                         to a first working slice rather than the
+#                         full original spec: single-value stats
+#                         (distance, elevation, power, HR, cadence,
+#                         calories, TSS/IF, L/R balance, equipment
+#                         used) plus four charts (altitude profile,
+#                         power, heart rate, cadence) plotted against
+#                         distance. Deferred to a later pass: drag-
+#                         select-to-recompute interactivity, and
+#                         linking from the Ride History cards (which
+#                         needs a date-to-ride lookup with a graceful
+#                         "no ride found" fallback, since several of
+#                         tonight's seeded historical entries have no
+#                         corresponding ride row at all). Built as a
+#                         server-rendered HTML page shown in an
+#                         iframe, same proven pattern as /dashboard,
+#                         rather than adding a new client-side
+#                         charting dependency to the app shell.
+#                         Streams get downsampled for the charts
+#                         (~400 points) since a multi-hour ride can be
+#                         7,000+ raw samples — full resolution stays
+#                         intact for the stats above, this only
+#                         affects what gets plotted. Reachable via a
+#                         new "View ride details" link after upload,
+#                         using the ride_id already tracked from the
+#                         equipment picker.
+#                         Tested before shipping: downsampling target
+#                         verified, full render with realistic stream
+#                         data, graceful fallback for rides with no
+#                         stream data (pre-dates raw storage), HTML-
+#                         escaping verified against an injection
+#                         attempt, mismatched-length stream arrays
+#                         (a realistic case — different fields can
+#                         have slightly different sample counts)
+#                         handled without crashing, and the generated
+#                         Chart.js JS syntax-checked directly.
+#   2.2.0 (2026-07-27) — three pieces built together tonight:
+#                         AI TOOL-USE SYSTEM (step 5 of the ride data
+#                         plan) — 5 tools (metric-by-mile-range,
+#                         push-segment detection, HR/power zone
+#                         breakdown, combined numeric+keyword search
+#                         across rides and coaching history with
+#                         count-first/narrow-on-request behavior, and
+#                         direct dated-log lookup), wired into both
+#                         the post-upload assessment and the ongoing
+#                         coaching chat via a proper tool-use loop
+#                         (run_claude_with_tools). Caught and fixed
+#                         two real bugs before shipping: ride_id was
+#                         never being passed to get_coaching_summary
+#                         at all (would have made the new tools
+#                         uncallable during the post-upload deep-dive
+#                         specifically), and a None system-prompt case
+#                         that could have sent a malformed request.
+#                         Added search_preferences as a 6th memory
+#                         theme, same mechanism as the other five.
+#                         PERSISTENT LAST-RIDE SYNOPSIS — the
+#                         assessment shown once at upload was
+#                         discarded after; now saved (coaching_synopsis
+#                         column) and shown as a card at the top of
+#                         the Dashboard until the next ride replaces
+#                         it. HTML-escaped (verified against a raw
+#                         script-tag test case before shipping).
+#                         EQUIPMENT/SETUP TRACKING — new equipment
+#                         roster table, captured via the profile
+#                         interview (indoor trainer as its own entry,
+#                         not just outdoor bike variants), picked from
+#                         a dropdown per ride rather than typed fresh.
+#                         Caught a real bug before it shipped: the
+#                         interview's generic profile-field-saving
+#                         loop would have tried to insert an
+#                         "equipment" list as a literal column on the
+#                         profiles table — handled separately now.
+#                         Frontend: cycling_coach_app.html gets a new
+#                         equipment picker card, shown after a
+#                         successful FIT upload.
+#                         Tested before shipping: unit tests on all
+#                         four new tool algorithms against synthetic
+#                         data, simulated tool-use loop control flow,
+#                         three dashboard-render tests for the
+#                         synopsis card (renders correctly, absent
+#                         when there's nothing to show, only the most
+#                         recent ride's synopsis appears), branching
+#                         tests on the equipment-extraction logic, and
+#                         a full integration check importing the whole
+#                         module fresh with realistic combined data.
 #   2.1.1 (2026-07-26) — added a dedicated /health endpoint, separate
 #                         from / (which doubles as the version-check
 #                         endpoint). Testing whether that overlap is
@@ -238,7 +333,7 @@
 #   1.0.0                initial live build — dashboard, FIT upload,
 #                         Strava OAuth + sync, AI profile interview
 # ═══════════════════════════════════════════════════════════════════
-APP_VERSION = "2.1.1"
+APP_VERSION = "2.3.1"
 ADMIN_EMAILS = {"mtpujol@gmail.com"}
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Form
@@ -252,6 +347,7 @@ import secrets
 import os
 import json
 import re
+import html
 import tempfile
 from datetime import datetime, date, timedelta
 from collections import defaultdict
@@ -282,6 +378,7 @@ MEMORY_THEMES = {
     'recovery_readiness':    'Recovery & Readiness',
     'environmental_context': 'Environmental Context',
     'life_context':          'Life Context',
+    'search_preferences':    'Search & Filter Preferences',
 }
 
 def get_db():
@@ -333,6 +430,11 @@ def init_db():
             id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id),
             note TEXT, created_at TIMESTAMP DEFAULT NOW()
         );
+        CREATE TABLE IF NOT EXISTS equipment (
+            id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id),
+            name TEXT, created_at TIMESTAMP DEFAULT NOW(),
+            UNIQUE(user_id, name)
+        );
         CREATE TABLE IF NOT EXISTS imported_docs (
             id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id),
             filename TEXT, content TEXT, created_at TIMESTAMP DEFAULT NOW()
@@ -370,6 +472,8 @@ def init_db():
         ALTER TABLE rides ADD COLUMN IF NOT EXISTS training_stress_score FLOAT;
         ALTER TABLE rides ADD COLUMN IF NOT EXISTS intensity_factor FLOAT;
         ALTER TABLE rides ADD COLUMN IF NOT EXISTS elapsed_h FLOAT;
+        ALTER TABLE rides ADD COLUMN IF NOT EXISTS coaching_synopsis TEXT;
+        ALTER TABLE rides ADD COLUMN IF NOT EXISTS equipment_id INTEGER REFERENCES equipment(id);
     """)
     cur.close(); conn.close()
 
@@ -552,6 +656,25 @@ def build_full_dashboard(rides, name, annual_goal=None):
 
     goal = annual_goal or ANNUAL_GOAL
     sorted_rides = sorted(rides, key=lambda r: r['ride_date'] if r.get('ride_date') else date.min)
+
+    # Persistent last-ride synopsis card — the assessment shown once at
+    # upload time, saved so it's still here on the next visit instead of
+    # vanishing after that one response.
+    synopsis_card = ""
+    if sorted_rides:
+        latest = sorted_rides[-1]
+        synopsis = latest.get('coaching_synopsis')
+        if synopsis:
+            latest_date = latest.get('ride_date')
+            date_str = latest_date.strftime('%B %d, %Y') if hasattr(latest_date, 'strftime') else str(latest_date)
+            synopsis_card = (
+                "<div class='synopsis-card'>"
+                + "<div class='synopsis-label'>Latest Ride Assessment</div>"
+                + "<div class='synopsis-date'>" + html.escape(date_str) + " &nbsp;&middot;&nbsp; "
+                + html.escape(str(latest.get('name', 'Ride'))) + "</div>"
+                + "<div class='synopsis-text'>" + html.escape(synopsis) + "</div>"
+                + "</div>"
+            )
 
     def to_date(d):
         if isinstance(d, date): return d
@@ -805,7 +928,7 @@ def build_full_dashboard(rides, name, annual_goal=None):
         "{scales:{y:{stacked:true,beginAtZero:true},x:{stacked:true,ticks:{maxRotation:45}}},"
         "zoomable:true,"
         "plugins:{tooltip:{mode:'index',intersect:false,"
-        "itemSort:function(a,b){return b.datasetIndex-a.datasetIndex;},"
+        "itemSort:function(a,b){var order={2:0,1:1,0:2,3:3};return order[a.datasetIndex]-order[b.datasetIndex];},"
         "callbacks:{label:function(ctx){"
         "var i=ctx.dataIndex;"
         "if(ctx.datasetIndex===3)return '5-min: '+(_p300[i]||'-')+'W';"
@@ -830,6 +953,10 @@ def build_full_dashboard(rides, name, annual_goal=None):
         + ".subtitle{color:#666;font-size:0.9rem;margin-bottom:20px;}"
         + ".stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:20px;}"
         + ".stat-card{background:var(--card);border-radius:10px;padding:14px 16px;box-shadow:0 2px 6px rgba(0,0,0,0.07);border-left:4px solid var(--blue2);}"
+        + ".synopsis-card{background:var(--card);border-radius:10px;padding:16px 20px;box-shadow:0 2px 6px rgba(0,0,0,0.07);border-left:4px solid var(--blue2);margin-bottom:20px;}"
+        + ".synopsis-card .synopsis-label{font-size:0.7rem;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--blue2);margin-bottom:6px;}"
+        + ".synopsis-card .synopsis-date{font-size:0.75rem;color:#888;margin-bottom:10px;}"
+        + ".synopsis-card .synopsis-text{font-size:0.9rem;line-height:1.6;color:#333;white-space:pre-wrap;}"
         + ".stat-card .label{font-size:0.7rem;color:#888;text-transform:uppercase;letter-spacing:.05em;}"
         + ".stat-card .value{font-size:1.5rem;font-weight:700;color:var(--blue);margin:4px 0 2px;}"
         + ".stat-card .sub{font-size:0.75rem;color:#666;}"
@@ -857,6 +984,8 @@ def build_full_dashboard(rides, name, annual_goal=None):
 
         + "<h1>&#x1F6B4; " + name + "'s Cycling Dashboard " + str(YEAR) + "</h1>"
         + "<p class='subtitle'>Updated " + date.today().strftime('%B %d, %Y') + " &nbsp;&middot;&nbsp; " + str(len(rides)) + " rides" + goal_subtitle + "</p>"
+
+        + synopsis_card
 
         + "<div class='stats-grid'>"
         + "<div class='stat-card green'><div class='label'>Year Total</div>"
@@ -986,7 +1115,317 @@ def build_full_dashboard(rides, name, annual_goal=None):
         + "</script></body></html>"
     )
 
-async def get_coaching_summary(user, metrics):
+# ── Coaching AI Tools ─────────────────────────────────────────────────────
+# A small number of general, reusable tools rather than one per possible
+# question. The AI decides which to call, with what parameters, and how
+# many times — these stay fixed, tested, narrow; no open-ended queries
+# get written on the fly by the model itself.
+
+COACHING_TOOLS = [
+    {
+        "name": "get_ride_metric_range",
+        "description": "Get the average/min/max for a specific metric (power, heart_rate, cadence, altitude, speed) over a specific mile range within one ride. Use for questions about a specific part of a ride, like 'what was my power between mile 8 and 10' or 'what was the gradient on that climb'. Only works for rides that have detailed stream data (uploaded/synced since the raw-data storage was added — older rides may not have this).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "ride_id": {"type": "integer", "description": "The ride's ID"},
+                "metric": {"type": "string", "enum": ["power", "heart_rate", "cadence", "altitude", "speed"]},
+                "start_mile": {"type": "number", "description": "Start of the range, in miles into the ride"},
+                "end_mile": {"type": "number", "description": "End of the range, in miles into the ride"}
+            },
+            "required": ["ride_id", "metric", "start_mile", "end_mile"]
+        }
+    },
+    {
+        "name": "find_push_segments",
+        "description": "Detect discrete hard-effort surges within one ride from its power data — sustained periods of elevated power, each with location (mile marker), duration, and average/max power. Use when asked to identify hard efforts or pushes within a specific ride, similar to identifying distinct climbs or surges.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"ride_id": {"type": "integer"}},
+            "required": ["ride_id"]
+        }
+    },
+    {
+        "name": "get_zone_breakdown",
+        "description": "Get time-in-zone breakdown for one ride — either power zones (based on FTP, needs FTP set in profile) or heart rate zones (estimated from age via 220-age, needs age set in profile). Use when asked about zone distribution or how much time was spent at different intensities.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "ride_id": {"type": "integer"},
+                "zone_type": {"type": "string", "enum": ["power", "heart_rate"]}
+            },
+            "required": ["ride_id", "zone_type"]
+        }
+    },
+    {
+        "name": "search_rides_and_history",
+        "description": "Search across all rides and coaching history using any combination of elevation range, distance range, date range, and a keyword searched against the coaching memory's dated log. Always returns a count plus a small preview (up to 10 examples) — never the full list. If the count is large, that's a cue to narrow further (ask the rider for more specifics, or search again with tighter constraints) rather than dump everything. Use to find specific rides matching criteria, or to search past coaching discussions by topic.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "elevation_min_ft": {"type": "number"},
+                "elevation_max_ft": {"type": "number"},
+                "distance_min_mi": {"type": "number"},
+                "distance_max_mi": {"type": "number"},
+                "date_start": {"type": "string", "description": "YYYY-MM-DD"},
+                "date_end": {"type": "string", "description": "YYYY-MM-DD"},
+                "keyword": {"type": "string", "description": "Search term matched against dated coaching log entries"}
+            },
+            "required": []
+        }
+    },
+    {
+        "name": "get_dated_log_entry",
+        "description": "Get the full coaching memory synopsis for one specific date. Use once a specific ride/date has been identified (e.g. via search_rides_and_history) and the rider wants the actual discussion/synopsis for that day — this is a direct lookup, not a search.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"date": {"type": "string", "description": "YYYY-MM-DD"}},
+            "required": ["date"]
+        }
+    }
+]
+
+def tool_get_ride_metric_range(user_id, ride_id, metric, start_mile, end_mile):
+    conn = get_db(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT id FROM rides WHERE id=%s AND user_id=%s", (ride_id, user_id))
+    if not cur.fetchone():
+        cur.close(); conn.close()
+        return {"error": "Ride not found or doesn't belong to this rider"}
+    cur.execute("SELECT streams FROM ride_streams WHERE ride_id=%s", (ride_id,))
+    row = cur.fetchone()
+    cur.close(); conn.close()
+    if not row or not row.get('streams'):
+        return {"error": "No detailed stream data available for this ride (only rides uploaded/synced since raw-data storage was added have this)"}
+    streams = row['streams']
+    distances = streams.get('distance')
+    if not distances:
+        return {"error": "No distance data available to locate the mile range for this ride"}
+    distances_mi = [d/1609.34 if d is not None else None for d in distances]
+    metric_vals = streams.get(metric)
+    if not metric_vals:
+        return {"error": f"No {metric} data available for this ride"}
+    matched = [
+        metric_vals[i] for i in range(min(len(distances_mi), len(metric_vals)))
+        if distances_mi[i] is not None and start_mile <= distances_mi[i] <= end_mile and metric_vals[i] is not None
+    ]
+    if not matched:
+        return {"error": f"No {metric} data found between mile {start_mile} and {end_mile} on this ride"}
+    return {
+        "metric": metric, "start_mile": start_mile, "end_mile": end_mile,
+        "avg": round(sum(matched)/len(matched), 1),
+        "min": round(min(matched), 1), "max": round(max(matched), 1),
+        "sample_count": len(matched)
+    }
+
+def tool_find_push_segments(user_id, ride_id):
+    conn = get_db(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT * FROM rides WHERE id=%s AND user_id=%s", (ride_id, user_id))
+    ride = cur.fetchone()
+    if not ride:
+        cur.close(); conn.close()
+        return {"error": "Ride not found or doesn't belong to this rider"}
+    cur.execute("SELECT streams FROM ride_streams WHERE ride_id=%s", (ride_id,))
+    srow = cur.fetchone()
+    cur.execute("SELECT ftp FROM profiles WHERE user_id=%s", (user_id,))
+    prow = cur.fetchone()
+    cur.close(); conn.close()
+    if not srow or not srow.get('streams'):
+        return {"error": "No detailed stream data available for this ride"}
+    streams = srow['streams']
+    powers = streams.get('power'); distances = streams.get('distance')
+    if not powers or not distances:
+        return {"error": "No power/distance data available for this ride"}
+
+    ftp = prow['ftp'] if prow and prow.get('ftp') else None
+    avg_power = ride.get('avg_power') or 150
+    threshold = ftp if ftp else round(avg_power * 1.3)
+    min_duration_samples = 30  # ~30s, assuming ~1 sample/sec recording
+
+    segments = []
+    i = 0; n = min(len(powers), len(distances))
+    while i < n:
+        if powers[i] is not None and powers[i] >= threshold:
+            start_i = i
+            while i < n and powers[i] is not None and powers[i] >= threshold:
+                i += 1
+            end_i = i
+            duration = end_i - start_i
+            if duration >= min_duration_samples:
+                seg_powers = [p for p in powers[start_i:end_i] if p is not None]
+                seg_dist = distances[start_i] if distances[start_i] is not None else None
+                segments.append({
+                    "start_mile": round(seg_dist/1609.34, 1) if seg_dist else None,
+                    "duration_seconds": duration,
+                    "avg_power": round(sum(seg_powers)/len(seg_powers)) if seg_powers else None,
+                    "max_power": round(max(seg_powers)) if seg_powers else None
+                })
+        else:
+            i += 1
+    return {"ride_id": ride_id, "threshold_watts": threshold, "segments_found": len(segments), "segments": segments[:10]}
+
+def tool_get_zone_breakdown(user_id, ride_id, zone_type):
+    conn = get_db(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT id FROM rides WHERE id=%s AND user_id=%s", (ride_id, user_id))
+    if not cur.fetchone():
+        cur.close(); conn.close()
+        return {"error": "Ride not found or doesn't belong to this rider"}
+    cur.execute("SELECT ftp, age FROM profiles WHERE user_id=%s", (user_id,))
+    prow = cur.fetchone()
+    cur.execute("SELECT streams FROM ride_streams WHERE ride_id=%s", (ride_id,))
+    srow = cur.fetchone()
+    cur.close(); conn.close()
+    if not srow or not srow.get('streams'):
+        return {"error": "No detailed stream data available for this ride"}
+    streams = srow['streams']
+
+    if zone_type == 'power':
+        ftp = prow['ftp'] if prow and prow.get('ftp') else None
+        if not ftp:
+            return {"error": "No FTP set in profile - can't compute power zones"}
+        vals = [p for p in (streams.get('power') or []) if p is not None]
+        if not vals:
+            return {"error": "No power data available for this ride"}
+        zones = {"Z1 (<55%)":0,"Z2 (56-75%)":0,"Z3 (76-90%)":0,"Z4 (91-105%)":0,"Z5 (106-120%)":0,"Z6 (121-150%)":0,"Z7 (>150%)":0}
+        for p in vals:
+            pct = p/ftp*100
+            if pct < 55: zones["Z1 (<55%)"] += 1
+            elif pct < 76: zones["Z2 (56-75%)"] += 1
+            elif pct < 91: zones["Z3 (76-90%)"] += 1
+            elif pct < 106: zones["Z4 (91-105%)"] += 1
+            elif pct < 121: zones["Z5 (106-120%)"] += 1
+            elif pct < 151: zones["Z6 (121-150%)"] += 1
+            else: zones["Z7 (>150%)"] += 1
+        total = len(vals)
+        return {"zone_type": "power", "ftp_used": ftp, "total_samples": total,
+                "zones_pct": {k: round(v/total*100, 1) for k, v in zones.items()}}
+    else:
+        age = prow['age'] if prow and prow.get('age') else None
+        if not age:
+            return {"error": "No age set in profile - can't estimate HR zones"}
+        est_max_hr = 220 - age
+        vals = [h for h in (streams.get('heart_rate') or []) if h is not None]
+        if not vals:
+            return {"error": "No heart rate data available for this ride"}
+        zones = {"Z1 (<60%)":0,"Z2 (60-70%)":0,"Z3 (70-80%)":0,"Z4 (80-90%)":0,"Z5 (>90%)":0}
+        for h in vals:
+            pct = h/est_max_hr*100
+            if pct < 60: zones["Z1 (<60%)"] += 1
+            elif pct < 70: zones["Z2 (60-70%)"] += 1
+            elif pct < 80: zones["Z3 (70-80%)"] += 1
+            elif pct < 90: zones["Z4 (80-90%)"] += 1
+            else: zones["Z5 (>90%)"] += 1
+        total = len(vals)
+        return {"zone_type": "heart_rate", "estimated_max_hr": est_max_hr,
+                "note": "max HR estimated from age via 220-age, not directly measured",
+                "total_samples": total, "zones_pct": {k: round(v/total*100, 1) for k, v in zones.items()}}
+
+def tool_search_rides_and_history(user_id, elevation_min_ft=None, elevation_max_ft=None,
+                                    distance_min_mi=None, distance_max_mi=None,
+                                    date_start=None, date_end=None, keyword=None):
+    conn = get_db(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    numeric_given = any(v is not None for v in [elevation_min_ft, elevation_max_ft, distance_min_mi, distance_max_mi, date_start, date_end])
+
+    numeric_rows = []; numeric_dates = None
+    if numeric_given:
+        conditions = ["user_id=%s"]; params = [user_id]
+        if elevation_min_ft is not None: conditions.append("elev_gain_ft >= %s"); params.append(elevation_min_ft)
+        if elevation_max_ft is not None: conditions.append("elev_gain_ft <= %s"); params.append(elevation_max_ft)
+        if distance_min_mi is not None: conditions.append("dist_mi >= %s"); params.append(distance_min_mi)
+        if distance_max_mi is not None: conditions.append("dist_mi <= %s"); params.append(distance_max_mi)
+        if date_start is not None: conditions.append("ride_date >= %s"); params.append(date_start)
+        if date_end is not None: conditions.append("ride_date <= %s"); params.append(date_end)
+        cur.execute(f"SELECT ride_date, name, dist_mi, elev_gain_ft FROM rides WHERE {' AND '.join(conditions)} ORDER BY ride_date DESC", params)
+        numeric_rows = [dict(r) for r in cur.fetchall()]
+        numeric_dates = {str(r['ride_date']) for r in numeric_rows}
+
+    keyword_rows = []; keyword_dates = None
+    if keyword:
+        cur.execute("SELECT entry_date, summary FROM coaching_memory_log WHERE user_id=%s AND summary ILIKE %s ORDER BY entry_date DESC",
+                    (user_id, f"%{keyword}%"))
+        keyword_rows = [dict(r) for r in cur.fetchall()]
+        keyword_dates = {str(r['entry_date']) for r in keyword_rows}
+    cur.close(); conn.close()
+
+    if numeric_dates is not None and keyword_dates is not None:
+        final_dates = numeric_dates & keyword_dates
+    elif numeric_dates is not None:
+        final_dates = numeric_dates
+    elif keyword_dates is not None:
+        final_dates = keyword_dates
+    else:
+        return {"error": "No search criteria provided - specify at least one filter (elevation, distance, date range, or keyword)"}
+
+    preview = []
+    for d in sorted(final_dates, reverse=True)[:10]:
+        entry = {"date": d}
+        ride_match = next((r for r in numeric_rows if str(r['ride_date']) == d), None)
+        if ride_match:
+            entry["name"] = ride_match.get('name')
+            entry["dist_mi"] = ride_match.get('dist_mi')
+            entry["elev_gain_ft"] = ride_match.get('elev_gain_ft')
+        kw_match = next((r for r in keyword_rows if str(r['entry_date']) == d), None)
+        if kw_match:
+            entry["summary_snippet"] = (kw_match.get('summary') or '')[:150]
+        preview.append(entry)
+    return {"count": len(final_dates), "preview": preview}
+
+def tool_get_dated_log_entry(user_id, date):
+    conn = get_db(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT entry_date, summary FROM coaching_memory_log WHERE user_id=%s AND entry_date=%s", (user_id, date))
+    row = cur.fetchone()
+    cur.close(); conn.close()
+    if not row:
+        return {"error": f"No coaching log entry found for {date}"}
+    return {"date": str(row['entry_date']), "summary": row['summary']}
+
+def execute_coaching_tool(name, tool_input, user_id):
+    try:
+        if name == "get_ride_metric_range":
+            return tool_get_ride_metric_range(user_id, **tool_input)
+        elif name == "find_push_segments":
+            return tool_find_push_segments(user_id, **tool_input)
+        elif name == "get_zone_breakdown":
+            return tool_get_zone_breakdown(user_id, **tool_input)
+        elif name == "search_rides_and_history":
+            return tool_search_rides_and_history(user_id, **tool_input)
+        elif name == "get_dated_log_entry":
+            return tool_get_dated_log_entry(user_id, **tool_input)
+        else:
+            return {"error": f"Unknown tool: {name}"}
+    except Exception as e:
+        return {"error": f"Tool execution failed: {str(e)}"}
+
+async def run_claude_with_tools(system_prompt, messages, user_id, max_tokens=900, max_iterations=5):
+    """Runs a Claude conversation with tool-use support, looping until a
+    final text-only response (no more tool calls) or max_iterations is hit.
+    Returns the final reply text. The tools stay fixed and narrow — the
+    model only ever decides which to call and with what parameters."""
+    for _ in range(max_iterations):
+        body = {"model": "claude-sonnet-4-6", "max_tokens": max_tokens,
+                "messages": messages, "tools": COACHING_TOOLS}
+        if system_prompt:
+            body["system"] = system_prompt
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01"},
+                json=body,
+                timeout=45
+            )
+            data = resp.json()
+        content_blocks = data.get('content', [])
+        tool_use_blocks = [b for b in content_blocks if b.get('type') == 'tool_use']
+        if not tool_use_blocks:
+            return ''.join(b.get('text', '') for b in content_blocks if b.get('type') == 'text')
+        messages.append({"role": "assistant", "content": content_blocks})
+        tool_results = []
+        for tb in tool_use_blocks:
+            result = execute_coaching_tool(tb['name'], tb.get('input', {}), user_id)
+            tool_results.append({"type": "tool_result", "tool_use_id": tb['id'], "content": json.dumps(result)})
+        messages.append({"role": "user", "content": tool_results})
+    return "I wasn't able to finish gathering everything needed to answer that fully — try asking a bit more specifically?"
+
+async def get_coaching_summary(user, metrics, ride_id=None):
     if not ANTHROPIC_KEY:
         return "AI coaching unavailable."
     try:
@@ -1041,6 +1480,7 @@ async def get_coaching_summary(user, metrics):
             + ("PERSONAL NOTES: " + "; ".join(notes) + "\n\n" if notes else "")
             + recent_ctx + memory_log_ctx + memory_themes_ctx + "\n"
             + "LATEST RIDE:\n"
+            + ("- Ride ID: " + str(ride_id) + " (use this for get_ride_metric_range, find_push_segments, or get_zone_breakdown if a deeper look at this specific ride would help)\n" if ride_id else "")
             + "- Date: " + str(metrics.get('ride_date','')) + "\n"
             + "- Distance: " + str(metrics.get('dist_mi','')) + " mi\n"
             + "- Avg power: " + str(metrics.get('avg_power','')) + "W, NP: " + str(metrics.get('norm_power','')) + "W\n"
@@ -1066,21 +1506,15 @@ async def get_coaching_summary(user, metrics):
             + "fences) shaped like: {\"dated_entry\": {\"date\":\"YYYY-MM-DD\",\"summary\":\"...\"} "
             + "or null, \"theme_updates\": {\"hydration_fueling\":\"...\" or null, "
             + "\"effort_perception\":\"...\" or null, \"recovery_readiness\":\"...\" or null, "
-            + "\"environmental_context\":\"...\" or null, \"life_context\":\"...\" or null}}. "
+            + "\"environmental_context\":\"...\" or null, \"life_context\":\"...\" or null, "
+            + "\"search_preferences\":\"...\" or null}}. "
             + "Include a dated_entry for this ride if anything is worth remembering later. Only "
             + "fill in a theme_update for a theme this ride actually informs; each one you include "
             + "must be the FULL updated pattern (folding in what's new with what's shown above), "
             + "not just the new piece. Keep every summary/update to 2-3 sentences, distilled."
         )
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01"},
-                json={"model":"claude-sonnet-4-6","max_tokens":800,
-                      "messages":[{"role":"user","content":prompt}]},
-                timeout=30
-            )
-            full_text = resp.json()['content'][0]['text']
+        messages = [{"role": "user", "content": prompt}]
+        full_text = await run_claude_with_tools(None, messages, user['id'], max_tokens=800)
 
         # Extract the trailing memory-update JSON and apply it — same pattern as
         # /coaching/chat. The user only ever sees the text before this marker.
@@ -1190,7 +1624,13 @@ async def upload_fit(file: UploadFile = File(...), notes: str = Form(default="")
         cur.execute("INSERT INTO ride_streams (ride_id, streams) VALUES (%s,%s)",
                     (ride_id, psycopg2.extras.Json(streams)))
     cur.close(); conn.close()
-    coaching = await get_coaching_summary(user, metrics)
+    coaching = await get_coaching_summary(user, metrics, ride_id=ride_id)
+    # Persist the assessment so it survives past this one response — previously
+    # shown once and then gone. Powers the "last ride" card on the Dashboard.
+    if coaching and coaching != "AI coaching unavailable.":
+        conn3 = get_db(); cur3 = conn3.cursor()
+        cur3.execute("UPDATE rides SET coaching_synopsis=%s WHERE id=%s", (coaching, ride_id))
+        cur3.close(); conn3.close()
     return {"ride_id": ride_id, "metrics": metrics, "coaching": coaching}
 
 @app.get("/rides")
@@ -1214,6 +1654,47 @@ def get_notes(user: dict = Depends(get_current_user)):
     cur.execute("SELECT id, note, created_at FROM coaching_notes WHERE user_id=%s ORDER BY created_at DESC LIMIT 50", (user['id'],))
     notes = [dict(r) for r in cur.fetchall()]; cur.close(); conn.close()
     return {"notes": notes, "count": len(notes)}
+
+@app.get("/equipment")
+def get_equipment(user: dict = Depends(get_current_user)):
+    """List the rider's bike/setup roster, built once (via the profile
+    interview or added directly) and picked from per-ride rather than
+    typed fresh each time."""
+    conn = get_db(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT id, name FROM equipment WHERE user_id=%s ORDER BY name", (user['id'],))
+    rows = [dict(r) for r in cur.fetchall()]
+    cur.close(); conn.close()
+    return {"equipment": rows}
+
+@app.post("/equipment")
+def add_equipment(name: str = Form(...), user: dict = Depends(get_current_user)):
+    conn = get_db(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    try:
+        cur.execute("INSERT INTO equipment (user_id, name) VALUES (%s,%s) ON CONFLICT (user_id, name) DO NOTHING RETURNING id",
+                    (user['id'], name.strip()))
+        row = cur.fetchone()
+        if not row:
+            cur.execute("SELECT id FROM equipment WHERE user_id=%s AND name=%s", (user['id'], name.strip()))
+            row = cur.fetchone()
+    finally:
+        cur.close(); conn.close()
+    return {"status": "saved", "id": row['id'], "name": name.strip()}
+
+@app.post("/rides/{ride_id}/equipment")
+def set_ride_equipment(ride_id: int, equipment_id: int = Form(...), user: dict = Depends(get_current_user)):
+    """Set which bike/setup was used for a specific ride — a quick pick
+    from the roster, separate from the Post-Ride Debrief note field."""
+    conn = get_db(); cur = conn.cursor()
+    cur.execute("SELECT id FROM equipment WHERE id=%s AND user_id=%s", (equipment_id, user['id']))
+    if not cur.fetchone():
+        cur.close(); conn.close()
+        raise HTTPException(status_code=404, detail="Equipment entry not found")
+    cur.execute("UPDATE rides SET equipment_id=%s WHERE id=%s AND user_id=%s", (equipment_id, ride_id, user['id']))
+    updated = cur.rowcount
+    cur.close(); conn.close()
+    if not updated:
+        raise HTTPException(status_code=404, detail="Ride not found")
+    return {"status": "saved", "ride_id": ride_id, "equipment_id": equipment_id}
 
 @app.get("/profile")
 def get_profile(user: dict = Depends(get_current_user)):
@@ -1317,6 +1798,7 @@ Your goal is to gather key information naturally through conversation:
 - Any injuries, recent illnesses, or medical conditions
 - Heat tolerance and any history of heat-related issues
 - Whether they have medical clearance if they mention serious conditions
+- What bikes or setups they ride — if they mention more than one (e.g. road vs. gravel tires on the same bike, a separate TT or mountain bike, riding a trainer indoors), ask them to list each distinct setup; if they only have one bike with no variation, a single entry or skipping this is fine
 
 IMPORTANT RULES:
 - If they mention any serious cardiac conditions, recent surgery, chest pain during exercise, or uncontrolled medical conditions: ALWAYS say they should consult their doctor before continuing and ask if they have medical clearance.
@@ -1327,8 +1809,8 @@ IMPORTANT RULES:
 - End by saying their profile has been saved and coaching will be personalized to them." + profile_ctx + "
 
 At the END of your response, on a new line, output a JSON object (and ONLY the JSON, no other text on that line) with any profile fields you extracted:
-{"age":null,"weight_lbs":null,"location":null,"fitness_level":null,"ftp":null,"annual_goal_mi":null,"other_goals":null,"health_notes":null,"injuries":null,"heat_tolerance":null,"medical_clearance":false}
-Only include fields where you extracted real information. Use null for unknown fields."""
+{"age":null,"weight_lbs":null,"location":null,"fitness_level":null,"ftp":null,"annual_goal_mi":null,"other_goals":null,"health_notes":null,"injuries":null,"heat_tolerance":null,"medical_clearance":false,"equipment":null}
+Only include fields where you extracted real information. Use null for unknown fields. For "equipment", if distinct bikes/setups were mentioned, use a list of short names (e.g. ["Road bike - 28mm tires","Gravel setup - 45mm tires","Indoor trainer"]); otherwise null."""
 
     messages = []
     if not hist:
@@ -1370,6 +1852,22 @@ Only include fields where you extracted real information. Use null for unknown f
                 pass
 
     # Save any extracted profile fields
+    if profile_update:
+        # Equipment needs its own table (a roster, not a single value) —
+        # handle it separately before the generic column-based save below,
+        # which would otherwise try to insert it as a literal column on
+        # profiles and fail (or worse, silently misbehave).
+        equipment_list = profile_update.pop('equipment', None)
+        if equipment_list and isinstance(equipment_list, list):
+            conn_e = get_db(); cur_e = conn_e.cursor()
+            for eq_name in equipment_list:
+                if eq_name and isinstance(eq_name, str):
+                    cur_e.execute(
+                        "INSERT INTO equipment (user_id, name) VALUES (%s,%s) ON CONFLICT (user_id, name) DO NOTHING",
+                        (user['id'], eq_name.strip())
+                    )
+            cur_e.close(); conn_e.close()
+
     if profile_update:
         conn = get_db(); cur = conn.cursor()
         fields = list(profile_update.keys())
@@ -1601,7 +2099,7 @@ async def coaching_chat(
         "{\"dated_entry\": {\"date\":\"YYYY-MM-DD\",\"summary\":\"...\"} or null, "
         "\"theme_updates\": {\"hydration_fueling\":\"...\" or null, \"effort_perception\":\"...\" "
         "or null, \"recovery_readiness\":\"...\" or null, \"environmental_context\":\"...\" or "
-        "null, \"life_context\":\"...\" or null}}\n"
+        "null, \"life_context\":\"...\" or null, \"search_preferences\":\"...\" or null}}\n"
         "Only include a dated_entry if a specific ride or dated episode was actually discussed "
         "with something worth remembering later — skip it for routine check-ins with nothing "
         "new. Only fill in a theme_update for a theme this exchange actually informed; leave "
@@ -1621,15 +2119,7 @@ async def coaching_chat(
     messages = list(hist) + [{"role": "user", "content": message}]
 
     try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01"},
-                json={"model": "claude-sonnet-4-6", "max_tokens": 900,
-                      "system": system_prompt, "messages": messages},
-                timeout=30
-            )
-            reply = resp.json()['content'][0]['text']
+        reply = await run_claude_with_tools(system_prompt, messages, user['id'], max_tokens=900)
     except Exception as e:
         return {"reply": "Sorry, I had trouble connecting. Please try again."}
 
@@ -2104,6 +2594,137 @@ def delete_ride(ride_id: int, user: dict = Depends(get_current_user)):
     if not deleted:
         raise HTTPException(status_code=404, detail="Ride not found")
     return {"status": "deleted", "id": ride_id}
+
+def _downsample(arr, target=400):
+    """Thin an array down for charting — a 2-3 hour ride can be 7,000+
+    samples, too many to plot smoothly, and a human reading the shape of
+    a line doesn't need per-second resolution to see it. Stats elsewhere
+    still use the full-resolution data; this is charts only."""
+    if not arr:
+        return []
+    n = len(arr)
+    step = max(1, n // target)
+    return arr[::step]
+
+def build_ride_detail_html(ride, streams):
+    def esc(s):
+        return html.escape(str(s)) if s is not None else ''
+    def j(v):
+        return json.dumps(v)
+
+    ride_date = ride.get('ride_date')
+    date_str = ride_date.strftime('%B %d, %Y') if hasattr(ride_date, 'strftime') else str(ride_date)
+
+    def stat(label, value, unit=''):
+        if value is None or value == '':
+            return ''
+        return "<div class='dstat'><div class='dlabel'>" + esc(label) + "</div><div class='dvalue'>" + esc(value) + (" " + esc(unit) if unit else '') + "</div></div>"
+
+    stats_html = (
+        "<div class='dstats-grid'>"
+        + stat("Distance", ride.get('dist_mi'), "mi")
+        + stat("Moving Time", ride.get('duration_h'), "h")
+        + stat("Elevation Gain", ride.get('elev_gain_ft'), "ft")
+        + stat("Elevation Loss", ride.get('elev_loss_ft'), "ft")
+        + stat("Avg Power", ride.get('avg_power'), "W")
+        + stat("Normalized Power", ride.get('norm_power'), "W")
+        + stat("Avg HR", ride.get('avg_hr'), "bpm")
+        + stat("Max HR", ride.get('max_hr'), "bpm")
+        + stat("Avg Cadence", ride.get('avg_cadence'), "rpm")
+        + stat("Calories", ride.get('calories'))
+        + stat("Training Stress", ride.get('training_stress_score'))
+        + stat("Intensity Factor", ride.get('intensity_factor'))
+        + stat("L/R Balance", ride.get('avg_lr_balance'), "% right")
+        + stat("Equipment", ride.get('equipment_name'))
+        + "</div>"
+    )
+
+    has_streams = bool(streams and streams.get('distance'))
+    charts_html = ""
+    chart_js = ""
+
+    if has_streams:
+        distances_raw = streams.get('distance') or []
+        n = len(distances_raw)
+        distances_mi = [round(d/1609.34, 2) if d is not None else None for d in distances_raw]
+
+        def series(key, transform=None):
+            vals = (streams.get(key) or [])[:n]
+            vals = vals + [None] * (n - len(vals))
+            if transform:
+                vals = [transform(v) if v is not None else None for v in vals]
+            return vals
+
+        labels_ds = _downsample(distances_mi)
+        power_ds = _downsample(series('power'))
+        hr_ds = _downsample(series('heart_rate'))
+        cadence_ds = _downsample(series('cadence'))
+        alt_ds = _downsample(series('altitude', lambda a: round(a * 3.28084, 1)))
+
+        charts_html = (
+            "<div class='dchart-card'><h3>Altitude Profile</h3><canvas id='altChart'></canvas></div>"
+            "<div class='dchart-card'><h3>Power</h3><canvas id='powerChart'></canvas></div>"
+            "<div class='dchart-card'><h3>Heart Rate</h3><canvas id='hrChart'></canvas></div>"
+            "<div class='dchart-card'><h3>Cadence</h3><canvas id='cadChart'></canvas></div>"
+        )
+        chart_js = (
+            "const labels=" + j(labels_ds) + ";"
+            "const opts={responsive:true,animation:false,elements:{point:{radius:0},line:{tension:0.2}},"
+            "scales:{x:{title:{display:true,text:'Miles'},ticks:{maxTicksLimit:8}}}};"
+            "new Chart(document.getElementById('altChart'),{type:'line',data:{labels:labels,"
+            "datasets:[{data:" + j(alt_ds) + ",borderColor:'#9333ea',backgroundColor:'rgba(147,51,234,0.1)',fill:true}]},"
+            "options:Object.assign({},opts,{scales:Object.assign({},opts.scales,{y:{title:{display:true,text:'ft'}}})})});"
+            "new Chart(document.getElementById('powerChart'),{type:'line',data:{labels:labels,"
+            "datasets:[{data:" + j(power_ds) + ",borderColor:'#2563eb'}]},"
+            "options:Object.assign({},opts,{scales:Object.assign({},opts.scales,{y:{title:{display:true,text:'W'}}})})});"
+            "new Chart(document.getElementById('hrChart'),{type:'line',data:{labels:labels,"
+            "datasets:[{data:" + j(hr_ds) + ",borderColor:'#dc2626'}]},"
+            "options:Object.assign({},opts,{scales:Object.assign({},opts.scales,{y:{title:{display:true,text:'bpm'}}})})});"
+            "new Chart(document.getElementById('cadChart'),{type:'line',data:{labels:labels,"
+            "datasets:[{data:" + j(cadence_ds) + ",borderColor:'#059669'}]},"
+            "options:Object.assign({},opts,{scales:Object.assign({},opts.scales,{y:{title:{display:true,text:'rpm'}}})})});"
+        )
+    else:
+        charts_html = "<div class='dchart-card'><p class='dno-data'>No detailed chart data for this ride — only rides uploaded/synced since raw-data storage was added have this.</p></div>"
+
+    return (
+        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+        + "<style>"
+        + "body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;background:#f7f7f8;margin:0;padding:16px;color:#222;}"
+        + "h1{font-size:1.2rem;margin:0 0 2px;} .ddate{font-size:0.8rem;color:#888;margin-bottom:16px;}"
+        + "h3{font-size:0.85rem;margin:0 0 10px;color:#444;}"
+        + ".dstats-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:10px;margin-bottom:20px;}"
+        + ".dstat{background:#fff;border-radius:8px;padding:10px 12px;box-shadow:0 1px 4px rgba(0,0,0,0.06);border-left:3px solid #2563eb;}"
+        + ".dlabel{font-size:0.65rem;text-transform:uppercase;color:#999;letter-spacing:.03em;}"
+        + ".dvalue{font-size:1.05rem;font-weight:600;margin-top:2px;}"
+        + ".dchart-card{background:#fff;border-radius:8px;padding:14px;box-shadow:0 1px 4px rgba(0,0,0,0.06);margin-bottom:14px;}"
+        + ".dno-data{font-size:0.85rem;color:#888;text-align:center;padding:20px 0;}"
+        + "</style></head><body>"
+        + "<h1>" + esc(ride.get('name', 'Ride')) + "</h1>"
+        + "<div class='ddate'>" + esc(date_str) + "</div>"
+        + stats_html
+        + charts_html
+        + "<script src='https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js'></script>"
+        + "<script>" + chart_js + "</script>"
+        + "</body></html>"
+    )
+
+@app.get("/rides/{ride_id}/detail-page", response_class=HTMLResponse)
+def get_ride_detail_page(ride_id: int, user: dict = Depends(get_current_user)):
+    conn = get_db(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("""SELECT r.*, e.name AS equipment_name FROM rides r
+        LEFT JOIN equipment e ON r.equipment_id = e.id
+        WHERE r.id=%s AND r.user_id=%s""", (ride_id, user['id']))
+    ride = cur.fetchone()
+    if not ride:
+        cur.close(); conn.close()
+        raise HTTPException(status_code=404, detail="Ride not found")
+    cur.execute("SELECT streams FROM ride_streams WHERE ride_id=%s", (ride_id,))
+    srow = cur.fetchone()
+    cur.close(); conn.close()
+    streams = srow['streams'] if srow else None
+    html_out = build_ride_detail_html(dict(ride), streams)
+    return HTMLResponse(content=html_out)
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def get_dashboard(user: dict = Depends(get_current_user)):
