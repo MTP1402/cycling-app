@@ -1,11 +1,32 @@
 # ═══════════════════════════════════════════════════════════════════
 # CYCLING COACH API — main.py
 #
-# VERSION: 2.3.1  (2026-07-27)
+# VERSION: 2.4.0  (2026-07-27)
 # Check this against GET / on the live Railway URL before assuming
 # a deploy has actually landed — the two should always match.
 #
 # CHANGELOG
+#   2.4.0 (2026-07-27) — two of the ride-detail page's deliberately-
+#                         deferred pieces from earlier tonight, done
+#                         together: added a left-right power balance
+#                         chart (FIT-upload-only, same documented
+#                         asymmetry as everywhere else L/R balance
+#                         shows up — only appears when the data is
+#                         genuinely present, tested against real data,
+#                         an absent key, and a present-but-all-null
+#                         key, since that last one is a real edge
+#                         case). Also added GET /rides/by-date/{date}
+#                         — bridges the coaching memory's dated log
+#                         (which only has a date, no ride_id) through
+#                         to a ride's detail page; Ride History cards
+#                         are now clickable. If multiple rides share a
+#                         date, prefers whichever one has stream data,
+#                         since that gives an actually useful detail
+#                         page instead of the "no chart data"
+#                         fallback. History entries with no matching
+#                         ride (several of tonight's seeded historical
+#                         entries genuinely have none) get a clear
+#                         inline message instead of a broken link.
 #   2.3.1 (2026-07-27) — fixed the Sprint & Aerobic Power chart's
 #                         tooltip order — it was showing 5-min at the
 #                         top and 30s at the bottom (an explicit
@@ -333,7 +354,7 @@
 #   1.0.0                initial live build — dashboard, FIT upload,
 #                         Strava OAuth + sync, AI profile interview
 # ═══════════════════════════════════════════════════════════════════
-APP_VERSION = "2.3.1"
+APP_VERSION = "2.4.0"
 ADMIN_EMAILS = {"mtpujol@gmail.com"}
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Form
@@ -2661,11 +2682,19 @@ def build_ride_detail_html(ride, streams):
         cadence_ds = _downsample(series('cadence'))
         alt_ds = _downsample(series('altitude', lambda a: round(a * 3.28084, 1)))
 
+        # L/R balance is FIT-upload-only (Strava's API doesn't expose it) —
+        # only show this chart when there's real data, same graceful-absence
+        # approach used for the whole chart section when streams are missing.
+        lr_raw = streams.get('left_right_balance') or []
+        has_lr = any(v is not None for v in lr_raw)
+        lr_ds = _downsample(series('left_right_balance')) if has_lr else []
+
         charts_html = (
             "<div class='dchart-card'><h3>Altitude Profile</h3><canvas id='altChart'></canvas></div>"
             "<div class='dchart-card'><h3>Power</h3><canvas id='powerChart'></canvas></div>"
             "<div class='dchart-card'><h3>Heart Rate</h3><canvas id='hrChart'></canvas></div>"
             "<div class='dchart-card'><h3>Cadence</h3><canvas id='cadChart'></canvas></div>"
+            + ("<div class='dchart-card'><h3>Left/Right Power Balance</h3><canvas id='lrChart'></canvas></div>" if has_lr else "")
         )
         chart_js = (
             "const labels=" + j(labels_ds) + ";"
@@ -2683,6 +2712,10 @@ def build_ride_detail_html(ride, streams):
             "new Chart(document.getElementById('cadChart'),{type:'line',data:{labels:labels,"
             "datasets:[{data:" + j(cadence_ds) + ",borderColor:'#059669'}]},"
             "options:Object.assign({},opts,{scales:Object.assign({},opts.scales,{y:{title:{display:true,text:'rpm'}}})})});"
+            + ("new Chart(document.getElementById('lrChart'),{type:'line',data:{labels:labels,"
+               "datasets:[{data:" + j(lr_ds) + ",borderColor:'#ea580c',label:'% right'}]},"
+               "options:Object.assign({},opts,{plugins:{legend:{display:false}},scales:Object.assign({},opts.scales,{y:{title:{display:true,text:'% right'},suggestedMin:30,suggestedMax:70}})})});"
+               if has_lr else "")
         )
     else:
         charts_html = "<div class='dchart-card'><p class='dno-data'>No detailed chart data for this ride — only rides uploaded/synced since raw-data storage was added have this.</p></div>"
@@ -2708,6 +2741,27 @@ def build_ride_detail_html(ride, streams):
         + "<script>" + chart_js + "</script>"
         + "</body></html>"
     )
+
+@app.get("/rides/by-date/{ride_date}")
+def get_ride_by_date(ride_date: str, user: dict = Depends(get_current_user)):
+    """Look up a ride by exact date — bridges the coaching memory's
+    dated log (which has no ride_id, only a date) through to a ride's
+    detail page. If multiple rides share a date, prefers one that has
+    stream data, since that gives a more useful detail page than the
+    "no chart data" fallback."""
+    conn = get_db(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("""
+        SELECT r.id FROM rides r
+        LEFT JOIN ride_streams rs ON rs.ride_id = r.id
+        WHERE r.user_id=%s AND r.ride_date=%s
+        ORDER BY (rs.ride_id IS NOT NULL) DESC, r.id DESC
+        LIMIT 1
+    """, (user['id'], ride_date))
+    row = cur.fetchone()
+    cur.close(); conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="No ride found for this date")
+    return {"ride_id": row['id']}
 
 @app.get("/rides/{ride_id}/detail-page", response_class=HTMLResponse)
 def get_ride_detail_page(ride_id: int, user: dict = Depends(get_current_user)):
