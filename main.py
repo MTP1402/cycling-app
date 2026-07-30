@@ -1,11 +1,32 @@
 # ═══════════════════════════════════════════════════════════════════
 # CYCLING COACH API — main.py
 #
-# VERSION: 2.5.1  (2026-07-29)
+# VERSION: 2.6.0  (2026-07-29)
 # Check this against GET / on the live Railway URL before assuming
 # a deploy has actually landed — the two should always match.
 #
 # CHANGELOG
+#   2.6.0 (2026-07-29) — added GET /rides/export: full ride history
+#                         as a downloadable .xlsx workbook — every
+#                         tracked field (distance, power, HR, cadence,
+#                         sprint bests, elevation gain/loss, calories,
+#                         TSS/IF, L/R balance, equipment, notes),
+#                         formatted header row, frozen top row,
+#                         auto-sized columns. NEW DEPENDENCY: requires
+#                         openpyxl added to requirements.txt on
+#                         GitHub — not something I can add myself,
+#                         since I only ever have main.py and
+#                         cycling_coach_app.html in front of me, not
+#                         the actual requirements file. Deploy will
+#                         fail with a missing-module error until
+#                         that's added.
+#                         Tested before shipping: full workbook
+#                         generation and save, a realistic ride with
+#                         many missing/None fields (handled without
+#                         crashing), and a genuine round-trip check —
+#                         re-opening the generated file to confirm
+#                         it's valid, not just that writing it didn't
+#                         error.
 #   2.5.1 (2026-07-29) — the coaching chat can now directly answer
 #                         "what's the date/time" — added get_local_now()
 #                         alongside the date-only helper from the
@@ -397,11 +418,11 @@
 #   1.0.0                initial live build — dashboard, FIT upload,
 #                         Strava OAuth + sync, AI profile interview
 # ═══════════════════════════════════════════════════════════════════
-APP_VERSION = "2.5.1"
+APP_VERSION = "2.6.0"
 ADMIN_EMAILS = {"mtpujol@gmail.com"}
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Form
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import psycopg2
@@ -1726,6 +1747,67 @@ def get_rides(user: dict = Depends(get_current_user)):
     cur.execute("SELECT * FROM rides WHERE user_id=%s ORDER BY ride_date DESC LIMIT 200", (user['id'],))
     rides = [dict(r) for r in cur.fetchall()]; cur.close(); conn.close()
     return {"rides": rides, "count": len(rides)}
+
+@app.get("/rides/export")
+def export_rides(user: dict = Depends(get_current_user)):
+    """Full ride history as a downloadable .xlsx workbook."""
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from io import BytesIO
+
+    conn = get_db(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("""SELECT r.*, e.name AS equipment_name FROM rides r
+        LEFT JOIN equipment e ON r.equipment_id = e.id
+        WHERE r.user_id=%s ORDER BY r.ride_date DESC""", (user['id'],))
+    rides = [dict(r) for r in cur.fetchall()]
+    cur.close(); conn.close()
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Rides"
+
+    headers = [
+        "Date", "Name", "Type", "Distance (mi)", "Moving Time (h)", "Elapsed Time (h)",
+        "Avg Power (W)", "Normalized Power (W)", "Avg HR (bpm)", "Max HR (bpm)",
+        "Avg Cadence (rpm)", "Max Cadence (rpm)", "5s Best (W)", "15s Best (W)",
+        "30s Best (W)", "5-min Best (W)", "Elevation Gain (ft)", "Elevation Loss (ft)",
+        "Calories", "TSS", "IF", "L/R Balance (% right)", "Equipment", "Temp (C)",
+        "Virtual", "Notes"
+    ]
+    ws.append(headers)
+    header_font = Font(bold=True, color="FFFFFF")
+    header_fill = PatternFill(start_color="2563EB", end_color="2563EB", fill_type="solid")
+    for cell in ws[1]:
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center")
+
+    for r in rides:
+        ws.append([
+            str(r.get('ride_date')) if r.get('ride_date') else None,
+            r.get('name'), r.get('ride_type'), r.get('dist_mi'), r.get('duration_h'),
+            r.get('elapsed_h'), r.get('avg_power'), r.get('norm_power'), r.get('avg_hr'),
+            r.get('max_hr'), r.get('avg_cadence'), r.get('max_cadence'), r.get('p5'),
+            r.get('p15'), r.get('p30'), r.get('p300'), r.get('elev_gain_ft'),
+            r.get('elev_loss_ft'), r.get('calories'), r.get('training_stress_score'),
+            r.get('intensity_factor'), r.get('avg_lr_balance'), r.get('equipment_name'),
+            r.get('temp_c'), ('Yes' if r.get('is_virtual') else 'No'), r.get('notes'),
+        ])
+
+    for col_cells in ws.columns:
+        max_len = max((len(str(c.value)) if c.value is not None else 0) for c in col_cells)
+        ws.column_dimensions[col_cells[0].column_letter].width = min(max_len + 2, 30)
+    ws.freeze_panes = "A2"
+
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    filename = "cycling_rides_export_" + get_local_today(None).isoformat() + ".xlsx"
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=" + filename}
+    )
 
 @app.post("/notes")
 def add_note(note: str = Form(...), user: dict = Depends(get_current_user)):
