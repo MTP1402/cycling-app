@@ -1,11 +1,23 @@
 # ═══════════════════════════════════════════════════════════════════
 # CYCLING COACH API — main.py
 #
-# VERSION: 2.5.0  (2026-07-29)
+# VERSION: 2.5.1  (2026-07-29)
 # Check this against GET / on the live Railway URL before assuming
 # a deploy has actually landed — the two should always match.
 #
 # CHANGELOG
+#   2.5.1 (2026-07-29) — the coaching chat can now directly answer
+#                         "what's the date/time" — added get_local_now()
+#                         alongside the date-only helper from the
+#                         previous fix, and a clearly-labeled CURRENT
+#                         DATE/TIME line at the very top of the system
+#                         prompt (rider's real local time, not the
+#                         server's), with an explicit instruction to
+#                         answer confidently from it rather than guess.
+#                         Refactored get_local_today() to derive from
+#                         get_local_now() instead of duplicating the
+#                         timezone lookup — verified this preserved
+#                         identical behavior before shipping.
 #   2.5.0 (2026-07-29) — fixed a real timezone bug: the coaching chat
 #                         was reasoning about "today" using the
 #                         server's UTC clock, not the rider's actual
@@ -385,7 +397,7 @@
 #   1.0.0                initial live build — dashboard, FIT upload,
 #                         Strava OAuth + sync, AI profile interview
 # ═══════════════════════════════════════════════════════════════════
-APP_VERSION = "2.5.0"
+APP_VERSION = "2.5.1"
 ADMIN_EMAILS = {"mtpujol@gmail.com"}
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Form
@@ -534,6 +546,17 @@ def init_db():
 def hash_password(pw):
     return hashlib.sha256(pw.encode()).hexdigest()
 
+def get_local_now(tz_name=None):
+    """The user's actual current local date and time, not the server's
+    UTC clock. Same reasoning as get_local_today() — Railway runs UTC,
+    Houston is UTC-5 in summer, so the raw server clock reads a
+    different wall-clock time than the rider's actual one."""
+    tz_name = tz_name or 'America/Chicago'
+    try:
+        return datetime.now(ZoneInfo(tz_name))
+    except Exception:
+        return datetime.now()
+
 def get_local_today(tz_name=None):
     """The user's actual local calendar date, not the server's. Railway
     runs UTC — during Houston evening hours (roughly 7pm-midnight CDT),
@@ -542,11 +565,7 @@ def get_local_today(tz_name=None):
     actual day. Defaults to America/Chicago (Houston) when a user
     hasn't set a timezone; falls back to server date only if the
     timezone name itself is somehow invalid."""
-    tz_name = tz_name or 'America/Chicago'
-    try:
-        return datetime.now(ZoneInfo(tz_name)).date()
-    except Exception:
-        return date.today()
+    return get_local_now(tz_name).date()
 
 def extract_json_object(text):
     """Pull a JSON object out of AI output that may be wrapped in markdown code
@@ -2034,7 +2053,9 @@ async def coaching_chat(
 
     goal = int(profile['annual_goal_mi']) if profile and profile.get('annual_goal_mi') else ANNUAL_GOAL
     total_mi = float(ytd['mi'] or 0)
-    local_today = get_local_today(profile.get('timezone') if profile else None)
+    local_now = get_local_now(profile.get('timezone') if profile else None)
+    local_today = local_now.date()
+    current_dt_ctx = "\nCURRENT DATE/TIME (rider's actual local time): " + local_now.strftime('%A, %B %d, %Y, %I:%M %p') + "\n"
     day_of_year = local_today.timetuple().tm_yday
     pace_mi = goal * day_of_year / 366
     pace_diff = round(total_mi - pace_mi, 1)
@@ -2109,8 +2130,10 @@ async def coaching_chat(
         "goals, and give specific, practical guidance for what's next. You have their exact "
         "year-to-date mileage and pace vs. goal below — use those real numbers, never ask the "
         "rider to tell you their own totals."
-        + profile_ctx + ytd_ctx + rides_ctx + notes_ctx + imported_ctx + memory_log_ctx + memory_themes_ctx +
+        + current_dt_ctx + profile_ctx + ytd_ctx + rides_ctx + notes_ctx + imported_ctx + memory_log_ctx + memory_themes_ctx +
         "\n\nIMPORTANT RULES:\n"
+        "- If asked what the date or time is, answer directly and confidently from the "
+        "CURRENT DATE/TIME line above — that's the rider's real local time, not a guess.\n"
         "- If they mention chest pain, serious cardiac symptoms, or any acute medical concern: "
         "tell them clearly to stop and see a doctor. Do not downplay it.\n"
         "- If they mention wanting to lose weight, acknowledge it warmly but redirect specific "
