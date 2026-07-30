@@ -4,3 +4,4 @@ psycopg2-binary
 fitparse
 httpx
 python-multipart
+openpyxl
