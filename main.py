@@ -1,11 +1,42 @@
 # ═══════════════════════════════════════════════════════════════════
 # CYCLING COACH API — main.py
 #
-# VERSION: 2.4.0  (2026-07-27)
+# VERSION: 2.5.0  (2026-07-29)
 # Check this against GET / on the live Railway URL before assuming
 # a deploy has actually landed — the two should always match.
 #
 # CHANGELOG
+#   2.5.0 (2026-07-29) — fixed a real timezone bug: the coaching chat
+#                         was reasoning about "today" using the
+#                         server's UTC clock, not the rider's actual
+#                         local time. Railway runs UTC; Houston is
+#                         UTC-5 in summer, so anywhere from ~7pm to
+#                         midnight local time, the server's date had
+#                         already rolled to the next calendar day
+#                         while the rider's actual day hadn't ended —
+#                         exactly the "it thinks I'm already in
+#                         tomorrow morning" symptom reported at 7:20pm
+#                         evening. Added a real per-user timezone
+#                         field on the profile (defaults to
+#                         America/Chicago, correct for the current
+#                         beta group) and a get_local_today() helper
+#                         using zoneinfo, so daylight saving is handled
+#                         automatically rather than a hardcoded offset
+#                         that would silently drift wrong twice a
+#                         year. Fixed both the coaching chat's date-
+#                         relative reasoning and the dashboard's pace-
+#                         vs-goal calculation, since both were built on
+#                         the same server-UTC date.today() call.
+#                         Tested against Marc's exact reported
+#                         scenario (a specific UTC timestamp that
+#                         reproduces the bug precisely), a winter date
+#                         to confirm DST handling needs no special-
+#                         casing, an invalid-timezone fallback so a bad
+#                         value can't crash the whole page, and — most
+#                         convincingly — run live at the actual current
+#                         moment: the old behavior gives July 30
+#                         (tomorrow), the fix gives July 29 (today),
+#                         confirmed in real time, not simulated.
 #   2.4.0 (2026-07-27) — two of the ride-detail page's deliberately-
 #                         deferred pieces from earlier tonight, done
 #                         together: added a left-right power balance
@@ -354,7 +385,7 @@
 #   1.0.0                initial live build — dashboard, FIT upload,
 #                         Strava OAuth + sync, AI profile interview
 # ═══════════════════════════════════════════════════════════════════
-APP_VERSION = "2.4.0"
+APP_VERSION = "2.5.0"
 ADMIN_EMAILS = {"mtpujol@gmail.com"}
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Form
@@ -371,6 +402,7 @@ import re
 import html
 import tempfile
 from datetime import datetime, date, timedelta
+from zoneinfo import ZoneInfo
 from collections import defaultdict
 import httpx
 
@@ -495,11 +527,26 @@ def init_db():
         ALTER TABLE rides ADD COLUMN IF NOT EXISTS elapsed_h FLOAT;
         ALTER TABLE rides ADD COLUMN IF NOT EXISTS coaching_synopsis TEXT;
         ALTER TABLE rides ADD COLUMN IF NOT EXISTS equipment_id INTEGER REFERENCES equipment(id);
+        ALTER TABLE profiles ADD COLUMN IF NOT EXISTS timezone TEXT;
     """)
     cur.close(); conn.close()
 
 def hash_password(pw):
     return hashlib.sha256(pw.encode()).hexdigest()
+
+def get_local_today(tz_name=None):
+    """The user's actual local calendar date, not the server's. Railway
+    runs UTC — during Houston evening hours (roughly 7pm-midnight CDT),
+    UTC has already rolled to the next calendar day, which was making
+    the coaching chat think "today" was a day ahead of the rider's
+    actual day. Defaults to America/Chicago (Houston) when a user
+    hasn't set a timezone; falls back to server date only if the
+    timezone name itself is somehow invalid."""
+    tz_name = tz_name or 'America/Chicago'
+    try:
+        return datetime.now(ZoneInfo(tz_name)).date()
+    except Exception:
+        return date.today()
 
 def extract_json_object(text):
     """Pull a JSON object out of AI output that may be wrapped in markdown code
@@ -671,7 +718,7 @@ def parse_fit_bytes(data):
     except Exception as e:
         raise HTTPException(status_code=400, detail="Could not parse FIT file: " + str(e))
 
-def build_full_dashboard(rides, name, annual_goal=None):
+def build_full_dashboard(rides, name, annual_goal=None, user_timezone=None):
     """Build the full Cycling Analytics dashboard matching the local version."""
     import json as _json
 
@@ -799,7 +846,7 @@ def build_full_dashboard(rides, name, annual_goal=None):
     coach_p5_top  = [(int(p5  or 0) - int(p10 or 0)) if p5  and p10 else None for p5, p10 in zip(coach_p5,  coach_p10)]
 
     # Progress
-    today        = date.today()
+    today        = get_local_today(user_timezone)
     day_of_year  = today.timetuple().tm_yday
     pace_mi      = round(goal * day_of_year / 366, 1)
     pace_diff    = round(total_mi - pace_mi, 1)
@@ -1987,13 +2034,14 @@ async def coaching_chat(
 
     goal = int(profile['annual_goal_mi']) if profile and profile.get('annual_goal_mi') else ANNUAL_GOAL
     total_mi = float(ytd['mi'] or 0)
-    day_of_year = date.today().timetuple().tm_yday
+    local_today = get_local_today(profile.get('timezone') if profile else None)
+    day_of_year = local_today.timetuple().tm_yday
     pace_mi = goal * day_of_year / 366
     pace_diff = round(total_mi - pace_mi, 1)
     pct_complete = round(total_mi / goal * 100, 1) if goal else 0
 
     ytd_ctx = (
-        "\nYEAR-TO-DATE PROGRESS (as of " + date.today().strftime('%Y-%m-%d') + "):\n"
+        "\nYEAR-TO-DATE PROGRESS (as of " + local_today.strftime('%Y-%m-%d') + "):\n"
         + "- Total this year: " + str(round(total_mi,1)) + " mi across " + str(ytd['n']) + " rides, "
         + str(round(float(ytd['hrs'] or 0),1)) + " hours, " + str(round(float(ytd['elev'] or 0))) + " ft climbed\n"
         + "- Annual goal: " + str(goal) + " mi (" + str(pct_complete) + "% complete)\n"
@@ -2327,7 +2375,7 @@ def debug_dashboard(user: dict = Depends(get_current_user)):
         cur.execute("SELECT * FROM rides WHERE user_id=%s AND ride_date >= %s AND ride_date < %s ORDER BY ride_date ASC LIMIT 5",
             (user['id'], f'{YEAR}-01-01', f'{YEAR+1}-01-01'))
         rides = [dict(r) for r in cur.fetchall()]; cur.close(); conn.close()
-        result = build_full_dashboard(rides, user['name'], annual_goal=user_goal)
+        result = build_full_dashboard(rides, user['name'], annual_goal=user_goal, user_timezone=profile.get('timezone') if profile else None)
         return {"status": "ok", "html_length": len(result), "rides": len(rides), "goal": user_goal}
     except Exception as e:
         return {"status": "error", "error": str(e), "traceback": traceback.format_exc()}
@@ -2792,7 +2840,7 @@ def get_dashboard(user: dict = Depends(get_current_user)):
             ORDER BY ride_date ASC""",
             (user['id'], f'{YEAR}-01-01', f'{YEAR+1}-01-01'))
         rides = [dict(r) for r in cur.fetchall()]; cur.close(); conn.close()
-        html = build_full_dashboard(rides, user['name'], annual_goal=user_goal)
+        html = build_full_dashboard(rides, user['name'], annual_goal=user_goal, user_timezone=profile.get('timezone') if profile else None)
         return HTMLResponse(content=html)
     except Exception as e:
         import traceback
