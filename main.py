@@ -1,11 +1,102 @@
 # ═══════════════════════════════════════════════════════════════════
 # CYCLING COACH API — main.py
 #
-# VERSION: 2.6.0  (2026-07-29)
+# VERSION: 2.8.0  (2026-07-29)
 # Check this against GET / on the live Railway URL before assuming
 # a deploy has actually landed — the two should always match.
 #
 # CHANGELOG
+#   2.8.0 (2026-07-29) — replaced start-time-proximity dedup with a
+#                         real time-window overlap check, per Marc's
+#                         exact real scenario: starting two separate
+#                         recording devices at different moments, and
+#                         sometimes forgetting to stop one for hours.
+#                         The previous fix (start times within 10 min)
+#                         could still miss both a staggered start past
+#                         10 min AND a forgotten-running device saved
+#                         much later — neither necessarily keeps start
+#                         times close. Now checks whether the two
+#                         rides' actual [start, device-off] windows
+#                         overlap at all, using elapsed_h (wall-clock
+#                         time including pauses) to compute a real end
+#                         time — correctly catches both cases
+#                         regardless of how mismatched the reported
+#                         distance/duration end up looking.
+#                         Bigger behavior change: when an overlap is
+#                         found, this no longer silently skips the
+#                         import. It imports the ride anyway and flags
+#                         it (possible_duplicate_of, a new column)
+#                         against the ride it overlaps — the app isn't
+#                         well-positioned to guess which of two
+#                         genuinely independent recordings is the
+#                         "right" one, so nothing gets silently
+#                         dropped or silently merged; it surfaces for
+#                         the rider to resolve. New GET /rides/flagged
+#                         to list flagged pairs, POST /rides/{id}/
+#                         clear-review to confirm two rides are
+#                         genuinely separate (clears the flag, keeps
+#                         both) — resolving as "wrong one" still just
+#                         uses the existing DELETE /rides/{id}.
+#                         Falls back to the original distance/duration-
+#                         only check (still an automatic skip,
+#                         unchanged) only when start_time or elapsed_h
+#                         isn't available — nothing to compute a
+#                         window from.
+#                         Frontend piece to actually see and resolve
+#                         flagged pairs NOT YET BUILT — this ships the
+#                         detection/data side only.
+#                         Tested thoroughly before shipping: the exact
+#                         real scenario end-to-end (staggered start +
+#                         14-hour forgotten stop, correctly flagged
+#                         against the real ride, not silently
+#                         dropped), confirmed this is a genuine
+#                         improvement over the previous start-time-only
+#                         fix (a 17-min stagger it would have missed),
+#                         a genuinely separate same-day ride correctly
+#                         NOT flagged, and placeholder/parameter
+#                         alignment manually verified in both queries.
+#   2.7.0 (2026-07-29) — fixed the actual duplicate-detection bug
+#                         behind a real double-count (rides 1077/1078
+#                         on 2026-07-29 — Karoo FIT uploaded to Strava
+#                         plus a separate phone-recorded Strava
+#                         activity of the same physical ride, imported
+#                         as two rides, doubling mileage/elevation on
+#                         the dashboard). The old check (distance
+#                         within 0.5mi, duration within 6min) wasn't
+#                         wide enough for two independently-recorded
+#                         devices, whose measured distance/duration
+#                         can genuinely drift more than that due to
+#                         GPS accuracy and differing auto-pause
+#                         behavior — even though it's unmistakably the
+#                         same ride. Added a new start_time column
+#                         (both FIT parsing and Strava sync already
+#                         extracted this, just discarded everything
+#                         but the date) and made start-time proximity
+#                         (within 10 min) the deciding factor whenever
+#                         it's available on both sides — start time
+#                         barely drifts between devices regardless of
+#                         GPS/pause differences. Falls back to the
+#                         original distance/duration check only when
+#                         start_time isn't available for at least one
+#                         side (older data predating this fix).
+#                         A real bug was caught and fixed during
+#                         testing, not just in the final version:
+#                         initially OR'd the new start-time check
+#                         alongside the old distance/duration one, but
+#                         testing specifically for false positives
+#                         found that two genuinely different same-day
+#                         rides with a coincidentally similar distance
+#                         got wrongly flagged as duplicates — that
+#                         risk existed in the original check too, OR'ing
+#                         a second condition on top didn't fix it.
+#                         Corrected so start-time is authoritative when
+#                         available, not just additive. Re-verified
+#                         against four cases after the fix: the real
+#                         bug scenario (still caught), the false-
+#                         positive case (now correctly NOT flagged),
+#                         old data with no start_time on either side
+#                         (unchanged fallback behavior), and mixed old/
+#                         new data with start_time on only one side.
 #   2.6.0 (2026-07-29) — added GET /rides/export: full ride history
 #                         as a downloadable .xlsx workbook — every
 #                         tracked field (distance, power, HR, cadence,
@@ -418,7 +509,7 @@
 #   1.0.0                initial live build — dashboard, FIT upload,
 #                         Strava OAuth + sync, AI profile interview
 # ═══════════════════════════════════════════════════════════════════
-APP_VERSION = "2.6.0"
+APP_VERSION = "2.8.0"
 ADMIN_EMAILS = {"mtpujol@gmail.com"}
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Form
@@ -560,6 +651,8 @@ def init_db():
         ALTER TABLE rides ADD COLUMN IF NOT EXISTS elapsed_h FLOAT;
         ALTER TABLE rides ADD COLUMN IF NOT EXISTS coaching_synopsis TEXT;
         ALTER TABLE rides ADD COLUMN IF NOT EXISTS equipment_id INTEGER REFERENCES equipment(id);
+        ALTER TABLE rides ADD COLUMN IF NOT EXISTS start_time TIMESTAMP;
+        ALTER TABLE rides ADD COLUMN IF NOT EXISTS possible_duplicate_of INTEGER REFERENCES rides(id);
         ALTER TABLE profiles ADD COLUMN IF NOT EXISTS timezone TEXT;
     """)
     cur.close(); conn.close()
@@ -730,6 +823,7 @@ def parse_fit_bytes(data):
 
         return {
             'ride_date':   start.strftime('%Y-%m-%d') if hasattr(start,'strftime') else str(start)[:10],
+            'start_time':  start.isoformat() if hasattr(start,'isoformat') else None,
             'name':        session.get('sport', 'Ride'),
             'dist_mi':     dist_mi,
             'duration_h':  duration_h,
@@ -1703,21 +1797,53 @@ async def upload_fit(file: UploadFile = File(...), notes: str = Form(default="")
     metrics = parse_fit_bytes(data)
     streams = metrics.pop('streams', None)  # keep out of the API response — big, browser doesn't need it
     conn = get_db(); cur = conn.cursor()
-    # Deduplication check
-    cur.execute("""SELECT id FROM rides WHERE user_id=%s
-        AND ABS(ride_date - %s::date) <= 1
-        AND ABS(COALESCE(dist_mi,0)-%s)<0.5 AND ABS(COALESCE(duration_h,0)-%s)<0.1""",
-        (user['id'], metrics['ride_date'], metrics.get('dist_mi') or 0, metrics.get('duration_h') or 0))
-    existing = cur.fetchone()
-    if existing:
-        cur.close(); conn.close()
-        return {"ride_id": existing[0], "metrics": metrics, "coaching": "Already in your database.", "duplicate": True}
-    cur.execute("""INSERT INTO rides (user_id,ride_date,name,dist_mi,duration_h,
+    # Deduplication — checks whether this ride's actual time WINDOW
+    # (start to device-off, not just start moment) overlaps an existing
+    # ride's window. Catches both a staggered start between two devices
+    # AND a forgotten-running device saved hours later — the earlier
+    # start-time-proximity fix could still miss either of those, since
+    # neither necessarily keeps start times close together. When windows
+    # overlap, this does NOT silently pick one — it imports the new ride
+    # too, flagged against the one it overlaps, so the rider resolves it
+    # themselves rather than the app guessing which recording is "right."
+    # Falls back to the original distance/duration-only check (still an
+    # automatic skip, unchanged) only when start_time or elapsed_h isn't
+    # available on this ride — nothing to overlap without both.
+    new_end_time = None
+    if metrics.get('start_time') and metrics.get('elapsed_h'):
+        try:
+            new_end_time = (datetime.fromisoformat(metrics['start_time']) + timedelta(hours=metrics['elapsed_h'])).isoformat()
+        except Exception:
+            new_end_time = None
+
+    duplicate_of_id = None
+    if metrics.get('start_time') and new_end_time:
+        cur.execute("""SELECT id FROM rides WHERE user_id=%s
+            AND ABS(ride_date - %s::date) <= 1
+            AND start_time IS NOT NULL AND elapsed_h IS NOT NULL
+            AND start_time <= %s::timestamp
+            AND %s::timestamp <= (start_time + (elapsed_h * INTERVAL '1 hour'))
+            LIMIT 1""",
+            (user['id'], metrics['ride_date'], new_end_time, metrics['start_time']))
+        overlap_match = cur.fetchone()
+        if overlap_match:
+            duplicate_of_id = overlap_match[0]
+    else:
+        cur.execute("""SELECT id FROM rides WHERE user_id=%s
+            AND ABS(ride_date - %s::date) <= 1
+            AND ABS(COALESCE(dist_mi,0)-%s)<0.5 AND ABS(COALESCE(duration_h,0)-%s)<0.1""",
+            (user['id'], metrics['ride_date'], metrics.get('dist_mi') or 0, metrics.get('duration_h') or 0))
+        existing = cur.fetchone()
+        if existing:
+            cur.close(); conn.close()
+            return {"ride_id": existing[0], "metrics": metrics, "coaching": "Already in your database.", "duplicate": True}
+
+    cur.execute("""INSERT INTO rides (user_id,ride_date,start_time,name,dist_mi,duration_h,
         avg_power,norm_power,avg_hr,max_hr,avg_cadence,max_cadence,
         p5,p15,p30,p300,elev_gain_ft,elev_loss_ft,calories,avg_lr_balance,
-        training_stress_score,intensity_factor,elapsed_h,ride_type,is_virtual,temp_c,notes)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
-        (user['id'], metrics['ride_date'], metrics.get('name'),
+        training_stress_score,intensity_factor,elapsed_h,ride_type,is_virtual,temp_c,notes,possible_duplicate_of)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+        (user['id'], metrics['ride_date'], metrics.get('start_time'), metrics.get('name'),
          metrics.get('dist_mi'), metrics.get('duration_h'),
          metrics.get('avg_power'), metrics.get('norm_power'),
          metrics.get('avg_hr'), metrics.get('max_hr'),
@@ -1726,7 +1852,7 @@ async def upload_fit(file: UploadFile = File(...), notes: str = Form(default="")
          metrics.get('elev_gain_ft'), metrics.get('elev_loss_ft'), metrics.get('calories'),
          metrics.get('avg_lr_balance'), metrics.get('training_stress_score'),
          metrics.get('intensity_factor'), metrics.get('elapsed_h'), metrics.get('ride_type','General'),
-         metrics.get('is_virtual', False), metrics.get('temp_c'), notes))
+         metrics.get('is_virtual', False), metrics.get('temp_c'), notes, duplicate_of_id))
     ride_id = cur.fetchone()[0]
     if streams:
         cur.execute("INSERT INTO ride_streams (ride_id, streams) VALUES (%s,%s)",
@@ -2621,7 +2747,7 @@ async def strava_sync(
     days_back_ts  = int(time.time()) - (days_back * 86400)
     year_start_ts = int(datetime(YEAR, 1, 1).timestamp())
     after_ts = max(days_back_ts, year_start_ts)
-    imported = 0; skipped = 0; errors = 0; out_of_range = 0
+    imported = 0; skipped = 0; errors = 0; out_of_range = 0; flagged = 0
     page = 1
 
     async with httpx.AsyncClient() as client:
@@ -2637,7 +2763,13 @@ async def strava_sync(
 
             for act in activities:
                 try:
-                    act_date = act.get('start_date_local','')[:10]
+                    start_local_raw = act.get('start_date_local','')
+                    act_date = start_local_raw[:10]
+                    # Strava's start_date_local is ISO-formatted with a "Z"
+                    # suffix despite representing local time, not UTC — take
+                    # just the date+time portion, dropping the Z, so it's
+                    # stored and compared as the activity's own local clock.
+                    start_time_val = start_local_raw[:19] if len(start_local_raw) >= 19 else None
                     # Hard safety net: skip anything outside the current YEAR
                     # even if it slipped past the after_ts filter (e.g. local
                     # timezone landing an activity just before Jan 1).
@@ -2650,14 +2782,46 @@ async def strava_sync(
                     sport    = act.get('sport_type','').lower()
                     is_virt  = act.get('trainer', False) or 'virtual' in sport or 'zwift' in (act.get('name','') or '').lower()
 
-                    # Deduplication
+                    # Deduplication — same overlap-window reasoning as
+                    # /upload: checks whether this activity's actual time
+                    # window (start to device-off) overlaps an existing
+                    # ride's window, not just whether start times are close.
+                    # Catches a staggered device start AND a forgotten-
+                    # running device saved hours later — the real scenario
+                    # that produced rides 1077/1078 on 2026-07-29. When
+                    # windows overlap, imports this ride too rather than
+                    # silently picking one, flagging it against the
+                    # overlapping ride for the rider to resolve. Falls back
+                    # to the original distance/duration-only check (still
+                    # an automatic skip) only when start_time or elapsed_h
+                    # isn't available — nothing to compute a window from.
                     cur3 = conn.cursor()
-                    cur3.execute("""SELECT id FROM rides WHERE user_id=%s
-                        AND ABS(ride_date - %s::date) <= 1
-                        AND ABS(COALESCE(dist_mi,0)-%s)<0.5 AND ABS(COALESCE(duration_h,0)-%s)<0.1""",
-                        (user['id'], act_date, dist_mi, dur_h))
-                    if cur3.fetchone():
-                        cur3.close(); skipped += 1; continue
+                    new_end_time = None
+                    if start_time_val and elapsed_h:
+                        try:
+                            new_end_time = (datetime.fromisoformat(start_time_val) + timedelta(hours=elapsed_h)).isoformat()
+                        except Exception:
+                            new_end_time = None
+
+                    duplicate_of_id = None
+                    if start_time_val and new_end_time:
+                        cur3.execute("""SELECT id FROM rides WHERE user_id=%s
+                            AND ABS(ride_date - %s::date) <= 1
+                            AND start_time IS NOT NULL AND elapsed_h IS NOT NULL
+                            AND start_time <= %s::timestamp
+                            AND %s::timestamp <= (start_time + (elapsed_h * INTERVAL '1 hour'))
+                            LIMIT 1""",
+                            (user['id'], act_date, new_end_time, start_time_val))
+                        overlap_match = cur3.fetchone()
+                        if overlap_match:
+                            duplicate_of_id = overlap_match[0]
+                    else:
+                        cur3.execute("""SELECT id FROM rides WHERE user_id=%s
+                            AND ABS(ride_date - %s::date) <= 1
+                            AND ABS(COALESCE(dist_mi,0)-%s)<0.5 AND ABS(COALESCE(duration_h,0)-%s)<0.1""",
+                            (user['id'], act_date, dist_mi, dur_h))
+                        if cur3.fetchone():
+                            cur3.close(); skipped += 1; continue
 
                     # Get stream data for power/HR/cadence/distance/time.
                     # Strava's public API doesn't expose left-right balance,
@@ -2705,17 +2869,17 @@ async def strava_sync(
 
                     ride_type = classify_ride(dist_mi, dur_h, avg_power, is_virt)
 
-                    cur3.execute("""INSERT INTO rides (user_id,ride_date,name,dist_mi,duration_h,
+                    cur3.execute("""INSERT INTO rides (user_id,ride_date,start_time,name,dist_mi,duration_h,
                         avg_power,norm_power,avg_hr,max_hr,avg_cadence,max_cadence,
-                        p5,p15,p30,p300,elev_gain_ft,elev_loss_ft,calories,elapsed_h,ride_type,is_virtual,temp_c,notes)
-                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
-                        (user['id'], act_date, act.get('name','Activity'),
+                        p5,p15,p30,p300,elev_gain_ft,elev_loss_ft,calories,elapsed_h,ride_type,is_virtual,temp_c,notes,possible_duplicate_of)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                        (user['id'], act_date, start_time_val, act.get('name','Activity'),
                          dist_mi, dur_h, avg_power, np_val,
                          avg_hr, act.get('max_heartrate'),
                          avg_cad, max(cads) if cads else None,
                          best_avg(powers,5), best_avg(powers,15), best_avg(powers,30), best_avg(powers,300),
                          elev_ft, elev_loss_ft, act.get('calories'), elapsed_h, ride_type, is_virt,
-                         act.get('average_temp'), None))
+                         act.get('average_temp'), None, duplicate_of_id))
                     new_ride_id = cur3.fetchone()[0]
 
                     # Keep the raw streams instead of discarding them —
@@ -2735,6 +2899,8 @@ async def strava_sync(
                                     (new_ride_id, psycopg2.extras.Json(stream_data)))
                     cur3.close()
                     imported += 1
+                    if duplicate_of_id:
+                        flagged += 1
                 except Exception as e:
                     errors += 1
 
@@ -2746,9 +2912,9 @@ async def strava_sync(
     cur.execute("UPDATE strava_tokens SET last_sync=NOW() WHERE user_id=%s", (user['id'],))
     cur.close(); conn.close()
 
-    return {"imported": imported, "skipped": skipped, "errors": errors, "out_of_range": out_of_range,
+    return {"imported": imported, "skipped": skipped, "errors": errors, "out_of_range": out_of_range, "flagged": flagged,
             "message": f"Synced {imported} new activities from Strava ({skipped} already existed, "
-                       f"{out_of_range} outside {YEAR})"}
+                       f"{out_of_range} outside {YEAR}" + (f", {flagged} possible duplicate{'s' if flagged != 1 else ''} to review" if flagged else "") + ")"}
 
 @app.delete("/rides/clear")
 def clear_rides(user: dict = Depends(get_current_user)):
@@ -2768,6 +2934,41 @@ def delete_ride(ride_id: int, user: dict = Depends(get_current_user)):
     if not deleted:
         raise HTTPException(status_code=404, detail="Ride not found")
     return {"status": "deleted", "id": ride_id}
+
+@app.get("/rides/flagged")
+def get_flagged_rides(user: dict = Depends(get_current_user)):
+    """Rides imported despite their time window overlapping an existing
+    ride's — flagged for the rider to resolve (delete the wrong one, or
+    confirm both are genuinely separate), rather than the app silently
+    guessing which recording is the real one."""
+    conn = get_db(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("""
+        SELECT f.id AS flagged_id, f.ride_date AS flagged_date, f.name AS flagged_name,
+               f.dist_mi AS flagged_dist, f.duration_h AS flagged_duration,
+               f.avg_power AS flagged_avg_power, f.avg_hr AS flagged_avg_hr,
+               o.id AS original_id, o.ride_date AS original_date, o.name AS original_name,
+               o.dist_mi AS original_dist, o.duration_h AS original_duration,
+               o.avg_power AS original_avg_power, o.avg_hr AS original_avg_hr
+        FROM rides f
+        JOIN rides o ON f.possible_duplicate_of = o.id
+        WHERE f.user_id=%s
+        ORDER BY f.ride_date DESC
+    """, (user['id'],))
+    pairs = [dict(r) for r in cur.fetchall()]
+    cur.close(); conn.close()
+    return {"flagged": pairs, "count": len(pairs)}
+
+@app.post("/rides/{ride_id}/clear-review")
+def clear_review(ride_id: int, user: dict = Depends(get_current_user)):
+    """Confirms a flagged ride is genuinely separate from the one it
+    overlapped, not a duplicate — clears the flag, keeps both rides."""
+    conn = get_db(); cur = conn.cursor()
+    cur.execute("UPDATE rides SET possible_duplicate_of=NULL WHERE id=%s AND user_id=%s", (ride_id, user['id']))
+    updated = cur.rowcount
+    cur.close(); conn.close()
+    if not updated:
+        raise HTTPException(status_code=404, detail="Ride not found")
+    return {"status": "cleared", "id": ride_id}
 
 def _downsample(arr, target=400):
     """Thin an array down for charting — a 2-3 hour ride can be 7,000+
