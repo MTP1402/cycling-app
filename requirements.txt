@@ -5,3 +5,5 @@ fitparse
 httpx
 python-multipart
 openpyxl
+pypdf
+python-docx
