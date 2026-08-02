@@ -1,11 +1,41 @@
 # ═══════════════════════════════════════════════════════════════════
 # CYCLING COACH API — main.py
 #
-# VERSION: 2.8.0  (2026-07-29)
+# VERSION: 2.9.0  (2026-07-29)
 # Check this against GET / on the live Railway URL before assuming
 # a deploy has actually landed — the two should always match.
 #
 # CHANGELOG
+#   2.9.0 (2026-07-29) — added drag-select-to-recompute on the ride-
+#                         detail page, the last deferred piece from
+#                         that original build. Drag across any chart
+#                         and it recomputes stats for just that
+#                         stretch — synced as a highlighted range
+#                         across all charts at once, using Chart.js's
+#                         own scale API (getValueForPixel /
+#                         getPixelForValue) to convert between mouse
+#                         position and the actual distance value,
+#                         rather than tracking raw pixels.
+#                         Stats are computed from the FULL-resolution
+#                         stream data (now embedded separately from
+#                         the ~400-point downsampled chart arrays),
+#                         not the thinned data used for rendering —
+#                         a short selection needs real precision, not
+#                         chart-smoothing-level approximation. Uses
+#                         the same non-zero-power averaging convention
+#                         as the rest of the app for consistency.
+#                         Tested thoroughly: the actual generated
+#                         computeSelectionStats function (not a
+#                         reimplementation) against a synthetic ride
+#                         with a distinct climb, confirming the climb
+#                         and a flat section produce clearly different,
+#                         correct stats, and that a reversed drag
+#                         (dragging right-to-left) gives identical
+#                         results to a forward drag. The drag/mouse
+#                         mechanics themselves can't be simulated in
+#                         this environment — worth trying for real to
+#                         confirm the feel, though the underlying
+#                         logic is fully verified.
 #   2.8.0 (2026-07-29) — replaced start-time-proximity dedup with a
 #                         real time-window overlap check, per Marc's
 #                         exact real scenario: starting two separate
@@ -509,7 +539,7 @@
 #   1.0.0                initial live build — dashboard, FIT upload,
 #                         Strava OAuth + sync, AI profile interview
 # ═══════════════════════════════════════════════════════════════════
-APP_VERSION = "2.8.0"
+APP_VERSION = "2.9.0"
 ADMIN_EMAILS = {"mtpujol@gmail.com"}
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Form
@@ -3036,6 +3066,17 @@ def build_ride_detail_html(ride, streams):
         cadence_ds = _downsample(series('cadence'))
         alt_ds = _downsample(series('altitude', lambda a: round(a * 3.28084, 1)))
 
+        # Full-resolution data, kept separate from the downsampled chart
+        # arrays above — a multi-hour ride can be 7,000+ samples, too many
+        # to render smoothly, but a drag-selected window needs real
+        # precision to compute accurate stats for just that stretch, not
+        # an approximation from ~400 thinned points.
+        full_dist = distances_mi
+        full_power = series('power')
+        full_hr = series('heart_rate')
+        full_cadence = series('cadence')
+        full_alt_ft = series('altitude', lambda a: round(a * 3.28084, 1))
+
         # L/R balance is FIT-upload-only (Strava's API doesn't expose it) —
         # only show this chart when there's real data, same graceful-absence
         # approach used for the whole chart section when streams are missing.
@@ -3044,11 +3085,12 @@ def build_ride_detail_html(ride, streams):
         lr_ds = _downsample(series('left_right_balance')) if has_lr else []
 
         charts_html = (
-            "<div class='dchart-card'><h3>Altitude Profile</h3><canvas id='altChart'></canvas></div>"
-            "<div class='dchart-card'><h3>Power</h3><canvas id='powerChart'></canvas></div>"
-            "<div class='dchart-card'><h3>Heart Rate</h3><canvas id='hrChart'></canvas></div>"
-            "<div class='dchart-card'><h3>Cadence</h3><canvas id='cadChart'></canvas></div>"
-            + ("<div class='dchart-card'><h3>Left/Right Power Balance</h3><canvas id='lrChart'></canvas></div>" if has_lr else "")
+            "<div class='dselect-bar' id='selectBar'>Drag across any chart below to see stats for just that stretch.</div>"
+            "<div class='dchart-card'><h3>Altitude Profile</h3><div class='dchart-wrap'><canvas id='altChart'></canvas><div class='dselect-overlay' id='altChartOv'></div></div></div>"
+            "<div class='dchart-card'><h3>Power</h3><div class='dchart-wrap'><canvas id='powerChart'></canvas><div class='dselect-overlay' id='powerChartOv'></div></div></div>"
+            "<div class='dchart-card'><h3>Heart Rate</h3><div class='dchart-wrap'><canvas id='hrChart'></canvas><div class='dselect-overlay' id='hrChartOv'></div></div></div>"
+            "<div class='dchart-card'><h3>Cadence</h3><div class='dchart-wrap'><canvas id='cadChart'></canvas><div class='dselect-overlay' id='cadChartOv'></div></div></div>"
+            + ("<div class='dchart-card'><h3>Left/Right Power Balance</h3><div class='dchart-wrap'><canvas id='lrChart'></canvas><div class='dselect-overlay' id='lrChartOv'></div></div></div>" if has_lr else "")
         )
         chart_js = (
             "const labels=" + j(labels_ds) + ";"
@@ -3070,6 +3112,59 @@ def build_ride_detail_html(ride, streams):
                "datasets:[{data:" + j(lr_ds) + ",borderColor:'#ea580c',label:'% right'}]},"
                "options:Object.assign({},opts,{plugins:{legend:{display:false}},scales:Object.assign({},opts.scales,{y:{title:{display:true,text:'% right'},suggestedMin:30,suggestedMax:70}})})});"
                if has_lr else "")
+            + (
+                "const fullData={dist:" + j(full_dist) + ",power:" + j(full_power) + ",hr:" + j(full_hr)
+                + ",cadence:" + j(full_cadence) + ",alt:" + j(full_alt_ft) + "};"
+                "const chartIds=" + j(['altChart','powerChart','hrChart','cadChart'] + (['lrChart'] if has_lr else [])) + ";"
+                "const charts={};chartIds.forEach(id=>{charts[id]=Chart.getChart(id);});"
+                # Distance range -> accurate stats, computed from full-resolution
+                # data (not the ~400-point downsampled chart data) so a short
+                # selection isn't distorted by thinning meant for smooth
+                # rendering, not stat accuracy.
+                "function computeSelectionStats(startMi,endMi){"
+                "const lo=Math.min(startMi,endMi),hi=Math.max(startMi,endMi);"
+                "const idxs=[];for(let i=0;i<fullData.dist.length;i++){if(fullData.dist[i]!=null&&fullData.dist[i]>=lo&&fullData.dist[i]<=hi)idxs.push(i);}"
+                "if(!idxs.length)return null;"
+                "const avg=(arr,exZero)=>{const v=idxs.map(i=>arr[i]).filter(x=>x!=null&&(!exZero||x>0));return v.length?Math.round(v.reduce((a,b)=>a+b,0)/v.length):null;};"
+                "const mx=(arr)=>{const v=idxs.map(i=>arr[i]).filter(x=>x!=null);return v.length?Math.round(Math.max(...v)):null;};"
+                "let elev=0;for(let k=1;k<idxs.length;k++){const a=fullData.alt[idxs[k-1]],b=fullData.alt[idxs[k]];if(a!=null&&b!=null&&b>a)elev+=(b-a);}"
+                # Non-zero power filter matches the app's established
+                # avg_power convention elsewhere (excludes coasting/stopped).
+                "return{distance:Math.round((hi-lo)*100)/100,avgPower:avg(fullData.power,true),maxPower:mx(fullData.power),"
+                "avgHr:avg(fullData.hr,false),maxHr:mx(fullData.hr),avgCadence:avg(fullData.cadence,true),elevGain:Math.round(elev)};"
+                "}"
+                "function updateOverlays(startMi,endMi){"
+                "chartIds.forEach(id=>{const c=charts[id],ov=document.getElementById(id+'Ov');if(!c||!ov)return;"
+                "const p1=c.scales.x.getPixelForValue(startMi),p2=c.scales.x.getPixelForValue(endMi);"
+                "ov.style.left=Math.min(p1,p2)+'px';ov.style.width=Math.abs(p2-p1)+'px';ov.style.display='block';});"
+                "}"
+                "function clearOverlays(){chartIds.forEach(id=>{const ov=document.getElementById(id+'Ov');if(ov)ov.style.display='none';});}"
+                "function showSelectionStats(s){const bar=document.getElementById('selectBar');"
+                "if(!s){bar.innerHTML='Drag across any chart below to see stats for just that stretch.';return;}"
+                "bar.innerHTML='<b>'+s.distance+' mi selected</b> &nbsp; '"
+                "+(s.avgPower!=null?'Avg Power: '+s.avgPower+'W (max '+s.maxPower+'W) &nbsp; ':'')"
+                "+(s.avgHr!=null?'Avg HR: '+s.avgHr+'bpm (max '+s.maxHr+'bpm) &nbsp; ':'')"
+                "+(s.avgCadence!=null?'Avg Cadence: '+s.avgCadence+'rpm &nbsp; ':'')"
+                "+(s.elevGain?'Elev Gain: '+s.elevGain+'ft &nbsp; ':'')"
+                "+'<a href=\"#\" onclick=\"clearSelection();return false;\" style=\"margin-left:8px;\">Clear</a>';}"
+                "function clearSelection(){clearOverlays();showSelectionStats(null);}"
+                "let dragState={active:false,startVal:null,chartId:null};"
+                "function pixelToValue(chart,canvas,clientX){const r=canvas.getBoundingClientRect();return chart.scales.x.getValueForPixel(clientX-r.left);}"
+                "function handleDragMove(clientX){if(!dragState.active)return;const c=charts[dragState.chartId],cv=document.getElementById(dragState.chartId);if(!c||!cv)return;"
+                "updateOverlays(dragState.startVal,pixelToValue(c,cv,clientX));}"
+                "function handleDragEnd(clientX){if(!dragState.active)return;const c=charts[dragState.chartId],cv=document.getElementById(dragState.chartId);dragState.active=false;if(!c||!cv)return;"
+                "const val=pixelToValue(c,cv,clientX);"
+                "if(Math.abs(val-dragState.startVal)<0.05){clearSelection();return;}"  # treat a near-zero drag as a click, not a selection
+                "updateOverlays(dragState.startVal,val);showSelectionStats(computeSelectionStats(dragState.startVal,val));}"
+                "chartIds.forEach(id=>{const cv=document.getElementById(id);if(!cv)return;"
+                "cv.addEventListener('mousedown',e=>{const c=charts[id];if(!c)return;dragState={active:true,startVal:pixelToValue(c,cv,e.clientX),chartId:id};});"
+                "cv.addEventListener('touchstart',e=>{const c=charts[id];if(!c||!e.touches[0])return;dragState={active:true,startVal:pixelToValue(c,cv,e.touches[0].clientX),chartId:id};},{passive:true});"
+                "});"
+                "document.addEventListener('mousemove',e=>handleDragMove(e.clientX));"
+                "document.addEventListener('touchmove',e=>{if(e.touches[0])handleDragMove(e.touches[0].clientX);},{passive:true});"
+                "document.addEventListener('mouseup',e=>handleDragEnd(e.clientX));"
+                "document.addEventListener('touchend',e=>handleDragEnd((e.changedTouches[0]||{}).clientX));"
+              if has_streams else "")
         )
     else:
         charts_html = "<div class='dchart-card'><p class='dno-data'>No detailed chart data for this ride — only rides uploaded/synced since raw-data storage was added have this.</p></div>"
@@ -3086,6 +3181,10 @@ def build_ride_detail_html(ride, streams):
         + ".dvalue{font-size:1.05rem;font-weight:600;margin-top:2px;}"
         + ".dchart-card{background:#fff;border-radius:8px;padding:14px;box-shadow:0 1px 4px rgba(0,0,0,0.06);margin-bottom:14px;}"
         + ".dno-data{font-size:0.85rem;color:#888;text-align:center;padding:20px 0;}"
+        + ".dchart-wrap{position:relative;}"
+        + ".dselect-overlay{position:absolute;top:0;bottom:0;display:none;background:rgba(37,99,235,0.12);border-left:2px solid #2563eb;border-right:2px solid #2563eb;pointer-events:none;}"
+        + ".dselect-bar{background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:10px 14px;margin-bottom:14px;font-size:0.8rem;color:#1e40af;}"
+        + "canvas{cursor:crosshair;}"
         + "</style></head><body>"
         + "<h1>" + esc(ride.get('name', 'Ride')) + "</h1>"
         + "<div class='ddate'>" + esc(date_str) + "</div>"
