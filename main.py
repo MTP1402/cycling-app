@@ -1,11 +1,32 @@
 # ═══════════════════════════════════════════════════════════════════
 # CYCLING COACH API — main.py
 #
-# VERSION: 2.13.0  (2026-08-03)
+# VERSION: 2.13.1  (2026-08-03)
 # Check this against GET / on the live Railway URL before assuming
 # a deploy has actually landed — the two should always match.
 #
 # CHANGELOG
+#   2.13.1 (2026-08-03) — fixed a real usability gap on the new Power
+#                         Curve chart, reported immediately after trying
+#                         it: the tooltip only fired on a pixel-perfect
+#                         hit against an invisible (pointRadius:0) point
+#                         sitting exactly on the line — workable with a
+#                         careful mouse, effectively impossible with a
+#                         finger on the phone app. Set interaction mode
+#                         to 'nearest' with axis:'x' and intersect:false,
+#                         so a hover or tap anywhere near a given duration
+#                         finds the closest point along the x-axis rather
+#                         than requiring an exact pixel match — standard
+#                         fix for this exact class of problem, same
+#                         approach the other ride-detail charts didn't
+#                         need only because they're driven by the
+#                         separate drag-select interaction instead of
+#                         point-hover tooltips. Also widened each point's
+#                         own hit target (pointHitRadius:20) as a second,
+#                         complementary fix, and added a small visible
+#                         dot on hover (pointHoverRadius:5) so there's
+#                         confirmation of exactly which point is
+#                         selected, not just a tooltip appearing.
 #   2.13.0 (2026-08-03) — added the Power Curve chart to the ride-detail
 #                         page (carried-over item from the handoff doc) —
 #                         continuous best-average-power across every
@@ -748,7 +769,7 @@
 #   1.0.0                initial live build — dashboard, FIT upload,
 #                         Strava OAuth + sync, AI profile interview
 # ═══════════════════════════════════════════════════════════════════
-APP_VERSION = "2.13.0"
+APP_VERSION = "2.13.1"
 ADMIN_EMAILS = {"mtpujol@gmail.com"}
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Form
@@ -3424,8 +3445,18 @@ def build_ride_detail_html(ride, streams):
                 "new Chart(document.getElementById('powerCurveChart'),{type:'line',data:{"
                 "datasets:[{data:" + j([{"x": p["duration_s"], "y": p["watts"]} for p in power_curve]) + ","
                 "borderColor:'#7c3aed',backgroundColor:'rgba(124,58,237,0.08)',fill:true,"
-                "pointRadius:0,tension:0.15,borderWidth:2}]},"
+                "pointRadius:0,pointHitRadius:20,pointHoverRadius:5,pointHoverBackgroundColor:'#7c3aed',"
+                "tension:0.15,borderWidth:2}]},"
+                # v2.13.1 fix: the tooltip originally only fired on a pixel-
+                # perfect hit against an invisible (radius-0) point on the
+                # line — workable with a mouse if you're careful, effectively
+                # impossible with a finger on mobile. interaction mode
+                # 'nearest' + axis:'x' + intersect:false means any hover/tap
+                # near a given duration finds the closest point along the
+                # x-axis, no exact pixel match needed; pointHitRadius:20
+                # widens each point's own hit target too, on top of that.
                 "options:{responsive:true,maintainAspectRatio:false,animation:false,"
+                "interaction:{mode:'nearest',axis:'x',intersect:false},"
                 "plugins:{legend:{display:false},tooltip:{callbacks:{"
                 "title:function(items){return fmtDur(items[0].parsed.x);},"
                 "label:function(ctx){return ctx.parsed.y+'W';}}}},"
