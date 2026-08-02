@@ -1,11 +1,67 @@
 # ═══════════════════════════════════════════════════════════════════
 # CYCLING COACH API — main.py
 #
-# VERSION: 2.12.0  (2026-08-03)
+# VERSION: 2.13.0  (2026-08-03)
 # Check this against GET / on the live Railway URL before assuming
 # a deploy has actually landed — the two should always match.
 #
 # CHANGELOG
+#   2.13.0 (2026-08-03) — added the Power Curve chart to the ride-detail
+#                         page (carried-over item from the handoff doc) —
+#                         continuous best-average-power across every
+#                         duration from 1s out to the full ride length,
+#                         not just the four fixed checkpoints (5s/15s/30s/
+#                         5-min) already shown on the long-term Dashboard
+#                         trend charts, which are untouched by this. New
+#                         compute_power_curve() helper: prefix-sum rolling-
+#                         window max per checkpoint duration (a log-ish
+#                         spaced set, dense at the short end and sparse at
+#                         the long end, matching the standard shape this
+#                         kind of curve is always drawn with) rather than
+#                         a naive O(n^2) scan over every possible duration,
+#                         which would be far too slow on a 3+ hour ride at
+#                         request time.
+#                         Deliberately treats a missing/None power reading
+#                         as 0 watts (genuine coasting), NOT filtered out
+#                         the way the existing p5/p15/p30/p300 checkpoints
+#                         are (see parse_fit_bytes) — a power curve needs
+#                         to reflect real sustained output including
+#                         recovery dips, and that's the standard
+#                         definition every comparable tool uses. This is a
+#                         new, separate computation making its own
+#                         deliberate choice, not a change to the existing
+#                         fixed-checkpoint convention elsewhere in the
+#                         file, which is intentionally left alone.
+#                         Chart has its own log-scale duration x-axis with
+#                         custom "5s/1m/5m/20m/1h" tick and tooltip
+#                         formatting — a completely different domain from
+#                         the mile-based charts above it, so it's
+#                         deliberately NOT added to the shared drag-
+#                         select-to-recompute chartIds group; dragging on
+#                         a duration axis wouldn't mean the same thing as
+#                         dragging on a mile-based one.
+#                         Scoped to time-domain only, matching what Marc
+#                         asked for tonight — no historical/rolling-window
+#                         comparison overlay (e.g. "vs last 6 weeks," as
+#                         seen in the reference screenshot) and no
+#                         distance-based best-effort ladder (5mi/10K/10mi/
+#                         20K + HR/elevation) — both stay explicitly on
+#                         the backlog as separate, larger pieces.
+#                         Hidden entirely (no card, no broken chart) on
+#                         rides with fewer than 3 computable duration
+#                         checkpoints — very short rides, or rides
+#                         predating raw-stream storage.
+#                         Tested before shipping: compute_power_curve()
+#                         verified against synthetic power data with a
+#                         known 60s all-out effort inside an otherwise
+#                         steady ride — the 60s checkpoint correctly
+#                         isolates the effort's true average, shorter
+#                         checkpoints inside that window read higher (as
+#                         expected, per-second exceeding the sustained
+#                         60s average), and checkpoints longer than the
+#                         effort correctly dilute toward the ride's
+#                         overall average as the window grows past it.
+#                         Generated Chart.js JS syntax-checked directly.
 #   2.12.0 (2026-08-03) — fixed two real bugs on the ride-detail page's
 #                         drag-select-to-recompute (built in 2.9.0, never
 #                         browser-tested until now): every chart there was
@@ -692,7 +748,7 @@
 #   1.0.0                initial live build — dashboard, FIT upload,
 #                         Strava OAuth + sync, AI profile interview
 # ═══════════════════════════════════════════════════════════════════
-APP_VERSION = "2.12.0"
+APP_VERSION = "2.13.0"
 ADMIN_EMAILS = {"mtpujol@gmail.com"}
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Form
@@ -3163,6 +3219,62 @@ def _downsample(arr, target=400):
     step = max(1, n // target)
     return arr[::step]
 
+def compute_power_curve(power_stream):
+    """Continuous best-average-power across a log-spaced set of durations
+    (1s out to the full ride length), for the ride-detail page's dedicated
+    Power Curve chart — a finer-resolution companion to the four fixed
+    checkpoints (5s/15s/30s/5-min) used on the long-term Dashboard trend
+    charts, which stay exactly as-is; this is scoped to one specific ride.
+
+    Deliberately treats a missing/None reading as 0 watts, same as a
+    genuine coasting sample — a power curve should reflect real sustained
+    output including recovery dips, not silently splice them out. This is
+    a different convention from p5/p15/p30/p300 elsewhere in this file,
+    which historically filter zero/coasting readings out before computing
+    bests (see parse_fit_bytes) — that's a pre-existing, deliberately
+    unchanged behavior for those fixed checkpoints; the power curve is a
+    new, separate computation free to make its own call, and "best average
+    power over a sustained duration" is the standard definition used by
+    every other tool that draws this kind of curve.
+
+    Assumes ~1 sample/second recording, same convention already used by
+    best_avg() and tool_find_push_segments() elsewhere in this file — the
+    stored streams don't carry a reliable per-sample interval, and this
+    matches how the rest of the app already treats them.
+
+    Uses a prefix-sum rolling-window max per checkpoint duration — O(n)
+    per checkpoint rather than a naive O(n) recompute from scratch inside
+    an O(n) outer loop over every possible duration (which would be
+    O(n^2) and, for a 3+ hour ride at ~10,800 samples, far too slow to
+    compute on every ride-detail page load).
+    """
+    if not power_stream:
+        return []
+    vals = [p if p is not None else 0 for p in power_stream]
+    n = len(vals)
+    if n < 5:
+        return []
+
+    prefix = [0] * (n + 1)
+    for i, v in enumerate(vals):
+        prefix[i + 1] = prefix[i] + v
+
+    # Log-ish spaced checkpoints, matching the density used by every other
+    # tool that draws this curve (dense at the short/anaerobic end, sparse
+    # at the long/aerobic end) — capped at the ride's own length below.
+    CHECKPOINTS = [
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 15, 20, 25, 30, 40, 50, 60, 75, 90,
+        120, 150, 180, 240, 300, 420, 600, 900, 1200, 1800, 2400, 3000,
+        3600, 4500, 5400, 7200, 9000, 10800, 14400, 18000, 21600
+    ]
+    curve = []
+    for d in CHECKPOINTS:
+        if d > n:
+            break
+        best_sum = max(prefix[i + d] - prefix[i] for i in range(n - d + 1))
+        curve.append({"duration_s": d, "watts": round(best_sum / d)})
+    return curve
+
 def build_ride_detail_html(ride, streams):
     def esc(s):
         return html.escape(str(s)) if s is not None else ''
@@ -3236,12 +3348,22 @@ def build_ride_detail_html(ride, streams):
         has_lr = any(v is not None for v in lr_raw)
         lr_ds = _downsample(series('left_right_balance')) if has_lr else []
 
+        # Power curve — continuous best-average-power across every duration,
+        # not just the four fixed dashboard checkpoints. Its own x-axis
+        # (duration, log scale) is a completely different domain from the
+        # mile-based charts above, so it's deliberately NOT part of the
+        # shared drag-select-to-recompute group below — dragging on it
+        # wouldn't mean the same thing as dragging on a mile-based chart.
+        power_curve = compute_power_curve(streams.get('power')) if streams.get('power') else []
+        has_power_curve = len(power_curve) >= 3  # need at least a few points for a meaningful curve
+
         charts_html = (
             "<div class='dselect-bar' id='selectBar'>Drag across any chart below to see stats for just that stretch.</div>"
             "<div class='dchart-card'><h3>Altitude Profile</h3><div class='dchart-wrap'><canvas id='altChart'></canvas><div class='dselect-overlay' id='altChartOv'></div></div></div>"
             "<div class='dchart-card'><h3>Power</h3><div class='dchart-wrap'><canvas id='powerChart'></canvas><div class='dselect-overlay' id='powerChartOv'></div></div></div>"
             "<div class='dchart-card'><h3>Heart Rate</h3><div class='dchart-wrap'><canvas id='hrChart'></canvas><div class='dselect-overlay' id='hrChartOv'></div></div></div>"
             "<div class='dchart-card'><h3>Cadence</h3><div class='dchart-wrap'><canvas id='cadChart'></canvas><div class='dselect-overlay' id='cadChartOv'></div></div></div>"
+            + ("<div class='dchart-card'><h3>Power Curve</h3><div class='dchart-wrap'><canvas id='powerCurveChart'></canvas></div></div>" if has_power_curve else "")
             + ("<div class='dchart-card'><h3>Left/Right Power Balance</h3><div class='dchart-wrap'><canvas id='lrChart'></canvas><div class='dselect-overlay' id='lrChartOv'></div></div></div>" if has_lr else "")
         )
         # ── v2.12.0 fix ──────────────────────────────────────────────────
@@ -3289,6 +3411,32 @@ def build_ride_detail_html(ride, streams):
                "datasets:[{data:pts(X," + j(lr_ds) + "),borderColor:'#ea580c',label:'% right'}]},"
                "options:Object.assign({},opts,{plugins:{legend:{display:false}},scales:Object.assign({},opts.scales,{y:{title:{display:true,text:'% right'},suggestedMin:30,suggestedMax:70}})})});"
                if has_lr else "")
+            + (
+                # Power curve — its own log-scale duration axis, its own tick/
+                # tooltip formatting (seconds -> "5s"/"1m"/"20m"/"1h"), and
+                # deliberately NOT added to chartIds below — its x-axis is
+                # duration, not miles, so it doesn't participate in the
+                # shared mile-based drag-select-to-recompute interaction.
+                "function fmtDur(s){"
+                "if(s<60)return s+'s';"
+                "if(s<3600){var m=s/60;return (m%1===0?m:m.toFixed(1))+'m';}"
+                "var h=s/3600;return (h%1===0?h:h.toFixed(1))+'h';}"
+                "new Chart(document.getElementById('powerCurveChart'),{type:'line',data:{"
+                "datasets:[{data:" + j([{"x": p["duration_s"], "y": p["watts"]} for p in power_curve]) + ","
+                "borderColor:'#7c3aed',backgroundColor:'rgba(124,58,237,0.08)',fill:true,"
+                "pointRadius:0,tension:0.15,borderWidth:2}]},"
+                "options:{responsive:true,maintainAspectRatio:false,animation:false,"
+                "plugins:{legend:{display:false},tooltip:{callbacks:{"
+                "title:function(items){return fmtDur(items[0].parsed.x);},"
+                "label:function(ctx){return ctx.parsed.y+'W';}}}},"
+                "scales:{x:{type:'logarithmic',title:{display:true,text:'Duration'},"
+                "ticks:{callback:function(v){"
+                "var nice=[1,5,15,30,60,300,600,1200,3600,7200,10800,21600];"
+                "if(nice.indexOf(v)===-1)return null;return fmtDur(v);}}},"
+                "y:{title:{display:true,text:'Watts'},beginAtZero:true}}}"
+                "});"
+                if has_power_curve else ""
+            )
             + (
                 "const fullData={dist:" + j(full_dist) + ",power:" + j(full_power) + ",hr:" + j(full_hr)
                 + ",cadence:" + j(full_cadence) + ",alt:" + j(full_alt_ft) + "};"
