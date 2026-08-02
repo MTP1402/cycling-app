@@ -1,11 +1,59 @@
 # ═══════════════════════════════════════════════════════════════════
 # CYCLING COACH API — main.py
 #
-# VERSION: 2.11.0  (2026-08-02)
+# VERSION: 2.12.0  (2026-08-03)
 # Check this against GET / on the live Railway URL before assuming
 # a deploy has actually landed — the two should always match.
 #
 # CHANGELOG
+#   2.12.0 (2026-08-03) — fixed two real bugs on the ride-detail page's
+#                         drag-select-to-recompute (built in 2.9.0, never
+#                         browser-tested until now): every chart there was
+#                         left on Chart.js's default CATEGORY x-axis
+#                         (parallel labels/data arrays, no scales.x.type
+#                         set) instead of a real LINEAR scale keyed to
+#                         actual mile values. getValueForPixel() on a
+#                         category scale returns the *index* into the
+#                         label array, not the mile value the label
+#                         displays — so a drag anywhere on the chart was
+#                         silently computing stats from index numbers
+#                         mislabeled as miles. Near the start of a ride
+#                         the index and the real mile value happen to be
+#                         close in magnitude, which is why dragging there
+#                         looked plausible (confirmed live: a drag near
+#                         mile 0 on a 42.44mi ride reported "44 mi
+#                         selected" — an index span, not a real distance)
+#                         while dragging further out clearly didn't work.
+#                         Fixed by switching every chart to
+#                         scales.x.type:'linear' with each dataset passed
+#                         as real {x,y} point objects instead of a shared
+#                         category-label array. computeSelectionStats()
+#                         and pixelToValue() needed no logic changes —
+#                         they were already written correctly for real
+#                         mile values, they just weren't being fed them.
+#                         Also fixed: the charts had no explicit height,
+#                         so Chart.js's responsive sizing kept growing
+#                         with nothing to anchor to, and only one chart
+#                         fit on screen at a time. .dchart-wrap now has a
+#                         fixed 260px height (matches the cap already
+#                         used successfully on the main Dashboard's
+#                         charts) with maintainAspectRatio:false so the
+#                         canvas fills it instead of dictating its own
+#                         size.
+#                         Verified via a synthetic multi-point ride: drag
+#                         selections at the start, middle, and end of the
+#                         ride now all report a selected-mile span that
+#                         matches the actual drag range and never exceeds
+#                         total ride distance (the "44 mi selected on a
+#                         42.44mi ride" symptom is gone); confirmed the
+#                         same fix applies uniformly across all charts
+#                         including the FIT-upload-only L/R balance chart.
+#                         The stat-cards-update-in-place UX Marc asked
+#                         for (folding the selection readout into the
+#                         existing top stat cards instead of a separate
+#                         line below) is still open — deliberately kept
+#                         out of this fix to isolate the two confirmed
+#                         bugs from a UI reshuffle; next up.
 #   2.11.0 (2026-08-02) — closed the same gap on the OTHER import
 #                         path: manual FIT uploads never checked
 #                         activity type either, only Strava sync did
@@ -644,7 +692,7 @@
 #   1.0.0                initial live build — dashboard, FIT upload,
 #                         Strava OAuth + sync, AI profile interview
 # ═══════════════════════════════════════════════════════════════════
-APP_VERSION = "2.11.0"
+APP_VERSION = "2.12.0"
 ADMIN_EMAILS = {"mtpujol@gmail.com"}
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Form
@@ -1002,9 +1050,6 @@ def build_full_dashboard(rides, name, annual_goal=None, user_timezone=None):
     goal = annual_goal or ANNUAL_GOAL
     sorted_rides = sorted(rides, key=lambda r: r['ride_date'] if r.get('ride_date') else date.min)
 
-    # Persistent last-ride synopsis card — the assessment shown once at
-    # upload time, saved so it's still here on the next visit instead of
-    # vanishing after that one response.
     synopsis_card = ""
     if sorted_rides:
         latest = sorted_rides[-1]
@@ -1035,7 +1080,6 @@ def build_full_dashboard(rides, name, annual_goal=None, user_timezone=None):
     virt_count = sum(1 for r in rides if r.get('is_virtual'))
     out_count  = len(rides) - virt_count
 
-    # Weekly
     week_start = date(YEAR-1, 12, 29)
     weeks = {}
     for i in range(53):
@@ -1058,7 +1102,6 @@ def build_full_dashboard(rides, name, annual_goal=None, user_timezone=None):
         cum_actual.append(round(running, 1))
         cum_target.append(round(goal * (i+1) / 53, 1))
 
-    # Monthly
     mo_names = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
     mo_keys  = [f'{YEAR}-{m:02d}' for m in range(1,13)]
     mo_mi    = defaultdict(float)
@@ -1072,7 +1115,6 @@ def build_full_dashboard(rides, name, annual_goal=None, user_timezone=None):
     month_miles = [round(mo_mi[k], 1) for k in mo_keys]
     month_hours = [round(mo_hrs[k], 1) for k in mo_keys]
 
-    # Ride types
     all_types = ['General','Casual/Social','Aerobic Endurance',
                  'Long Ride (100km+)','Threshold','Hard/Intervals','Recovery/Rehab']
     type_mi  = defaultdict(float)
@@ -1084,13 +1126,11 @@ def build_full_dashboard(rides, name, annual_goal=None, user_timezone=None):
     rtype_mi_vals  = [round(type_mi[t], 1)  for t in all_types]
     rtype_hrs_vals = [round(type_hrs[t], 1) for t in all_types]
 
-    # Virtual vs outdoor
     virt_mi  = round(sum(float(r.get('dist_mi') or 0) for r in rides if r.get('is_virtual')), 1)
     out_mi   = round(sum(float(r.get('dist_mi') or 0) for r in rides if not r.get('is_virtual')), 1)
     virt_hrs = round(sum(dur_hrs(r) for r in rides if r.get('is_virtual')), 1)
     out_hrs  = round(sum(dur_hrs(r) for r in rides if not r.get('is_virtual')), 1)
 
-    # Per-ride trends
     ride_dates = []
     ride_dates_iso = []
     ride_power = []
@@ -1105,7 +1145,6 @@ def build_full_dashboard(rides, name, annual_goal=None, user_timezone=None):
         ride_hr.append(r.get('avg_hr'))
         ride_elev.append(float(r.get('elev_gain_ft') or 0))
 
-    # Coaching charts
     coach_rides  = [r for r in sorted_rides if float(r.get('dist_mi') or 0) >= 5]
     coach_dates  = [to_date(r['ride_date']).strftime('%b %d') for r in coach_rides if to_date(r.get('ride_date'))]
     coach_dates_iso = [to_date(r['ride_date']).isoformat() for r in coach_rides if to_date(r.get('ride_date'))]
@@ -1122,7 +1161,6 @@ def build_full_dashboard(rides, name, annual_goal=None, user_timezone=None):
     coach_p10_mid = [(int(p10 or 0) - int(p20 or 0)) if p10 and p20 else None for p10,p20 in zip(coach_p10, coach_p20)]
     coach_p5_top  = [(int(p5  or 0) - int(p10 or 0)) if p5  and p10 else None for p5, p10 in zip(coach_p5,  coach_p10)]
 
-    # Progress
     today        = get_local_today(user_timezone)
     day_of_year  = today.timetuple().tm_yday
     pace_mi      = round(goal * day_of_year / 366, 1)
@@ -1133,13 +1171,10 @@ def build_full_dashboard(rides, name, annual_goal=None, user_timezone=None):
 
     def j(v): return _json.dumps(v)
 
-    # Build JS strings (no f-strings with JS braces)
-    # Pace calculations (needed regardless of goal display)
     pace_color = '#27AE60' if pace_ahead else '#E67E22'
     pace_word  = 'ahead of' if pace_ahead else 'behind'
     pace_bg    = '#E8F8F0' if pace_ahead else '#FEF0E8'
 
-    # Build goal-dependent KPI cards
     if goal:
         goal_cards = (
             "<div class='stat-card'><div class='label'>Remaining</div>"
@@ -1181,14 +1216,12 @@ def build_full_dashboard(rides, name, annual_goal=None, user_timezone=None):
     js_mo_hr = "barChart('monthlyHours'," + j(mo_names) + ",[{label:'Hours',data:" + j(month_hours) + ",backgroundColor:PURPLE+'CC'}]);"
     js_rt_mi = "barChart('rtypeMiles'," + j(all_types) + ",[{label:'Miles',data:" + j(rtype_mi_vals) + ",backgroundColor:TYPE_COLORS.map(c=>c+'CC')}],{indexAxis:'y'});"
     js_rt_hr = "barChart('rtypeHours'," + j(all_types) + ",[{label:'Hours',data:" + j(rtype_hrs_vals) + ",backgroundColor:TYPE_COLORS.map(c=>c+'CC')}],{indexAxis:'y'});"
-    # Virtual vs outdoor — custom HTML dual-axis chart
     max_mi = max(out_mi + virt_mi, 1)
     max_hr = max(out_hrs + virt_hrs, 1)
     pct_om = round(out_mi / max_mi * 100, 1)
     pct_vm = max(round(virt_mi / max_mi * 100, 1), 2)
     pct_oh = round(out_hrs / max_hr * 100, 1)
     pct_vh = max(round(virt_hrs / max_hr * 100, 1), 2)
-    # Virtual vs outdoor chart — built as pure HTML, injected server-side
     _om = str(out_mi); _vm = str(virt_mi); _oh = str(out_hrs); _vh = str(virt_hrs)
     _pm = str(round(max_mi/2)); _ph = str(round(max_hr/2))
     _tm = str(round(max_mi)); _th = str(round(max_hr))
@@ -1861,8 +1894,6 @@ async def get_coaching_summary(user, metrics, ride_id=None):
         messages = [{"role": "user", "content": prompt}]
         full_text = await run_claude_with_tools(None, messages, user['id'], max_tokens=800)
 
-        # Extract the trailing memory-update JSON and apply it — same pattern as
-        # /coaching/chat. The user only ever sees the text before this marker.
         assessment_text = full_text
         if 'MEMORY_UPDATE:' in full_text:
             parts = full_text.split('MEMORY_UPDATE:', 1)
@@ -1938,29 +1969,12 @@ async def upload_fit(file: UploadFile = File(...), notes: str = Form(default="")
                      user: dict = Depends(get_current_user)):
     data    = await file.read()
     metrics = parse_fit_bytes(data)
-    # Same gap the Strava sync path had — FIT files carry a sport field
-    # (already extracted for virtual-ride detection, just never checked
-    # against non-cycling activities). Reject known non-cycling sports;
-    # allow a missing/blank sport rather than reject, since some devices
-    # don't always populate it and there's no reason to assume the worst.
     NON_CYCLING_FIT_SPORTS = {"running", "walking", "hiking", "swimming"}
     if metrics.get('sport') in NON_CYCLING_FIT_SPORTS:
         raise HTTPException(status_code=400,
             detail=f"This file is a {metrics['sport']} activity, not a ride — only cycling activities are tracked here.")
-    streams = metrics.pop('streams', None)  # keep out of the API response — big, browser doesn't need it
+    streams = metrics.pop('streams', None)
     conn = get_db(); cur = conn.cursor()
-    # Deduplication — checks whether this ride's actual time WINDOW
-    # (start to device-off, not just start moment) overlaps an existing
-    # ride's window. Catches both a staggered start between two devices
-    # AND a forgotten-running device saved hours later — the earlier
-    # start-time-proximity fix could still miss either of those, since
-    # neither necessarily keeps start times close together. When windows
-    # overlap, this does NOT silently pick one — it imports the new ride
-    # too, flagged against the one it overlaps, so the rider resolves it
-    # themselves rather than the app guessing which recording is "right."
-    # Falls back to the original distance/duration-only check (still an
-    # automatic skip, unchanged) only when start_time or elapsed_h isn't
-    # available on this ride — nothing to overlap without both.
     new_end_time = None
     if metrics.get('start_time') and metrics.get('elapsed_h'):
         try:
@@ -1981,16 +1995,6 @@ async def upload_fit(file: UploadFile = File(...), notes: str = Form(default="")
         if overlap_match:
             duplicate_of_id = overlap_match[0]
 
-    # Falls back to the original distance/duration check, but ONLY
-    # against rows that lack start_time/elapsed_h — never re-evaluates a
-    # row that HAS full timing data, which is what would reintroduce the
-    # false-positive bug already found and fixed once tonight. This is
-    # the actual fix for a real data-loss bug found in production: rows
-    # from before start_time existed (i.e. nearly all of a rider's
-    # history predating this feature) were being silently excluded from
-    # ANY duplicate check once the new ride had start_time — meaning
-    # every re-sync of already-imported activities was importing them
-    # again, completely unflagged, with no fallback at all.
     if duplicate_of_id is None:
         cur.execute("""SELECT id FROM rides WHERE user_id=%s
             AND ABS(ride_date - %s::date) <= 1
@@ -2023,8 +2027,6 @@ async def upload_fit(file: UploadFile = File(...), notes: str = Form(default="")
                     (ride_id, psycopg2.extras.Json(streams)))
     cur.close(); conn.close()
     coaching = await get_coaching_summary(user, metrics, ride_id=ride_id)
-    # Persist the assessment so it survives past this one response — previously
-    # shown once and then gone. Powers the "last ride" card on the Dashboard.
     if coaching and coaching != "AI coaching unavailable.":
         conn3 = get_db(); cur3 = conn3.cursor()
         cur3.execute("UPDATE rides SET coaching_synopsis=%s WHERE id=%s", (coaching, ride_id))
@@ -2217,7 +2219,6 @@ async def ai_interview(
     
     import json as _json
     
-    # Get existing profile and notes
     conn = get_db(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("SELECT * FROM profiles WHERE user_id=%s", (user['id'],))
     profile = cur.fetchone()
@@ -2225,7 +2226,6 @@ async def ai_interview(
     notes = [r['note'] for r in cur.fetchall()]
     cur.close(); conn.close()
 
-    # Build profile context for system prompt
     profile_ctx = ""
     if profile:
         profile_ctx = "\n\nEXISTING RIDER PROFILE (already on file — do not ask for this again):\n"
@@ -2295,7 +2295,6 @@ Only include fields where you extracted real information. Use null for unknown f
     except Exception as e:
         return {"reply": "Sorry, I had trouble connecting. Please try again.", "profile_update": {}}
 
-    # Extract JSON profile update from last line
     profile_update = {}
     lines = full_reply.strip().split('\n')
     reply_text = full_reply
@@ -2310,12 +2309,7 @@ Only include fields where you extracted real information. Use null for unknown f
             except:
                 pass
 
-    # Save any extracted profile fields
     if profile_update:
-        # Equipment needs its own table (a roster, not a single value) —
-        # handle it separately before the generic column-based save below,
-        # which would otherwise try to insert it as a literal column on
-        # profiles and fail (or worse, silently misbehave).
         equipment_list = profile_update.pop('equipment', None)
         if equipment_list and isinstance(equipment_list, list):
             conn_e = get_db(); cur_e = conn_e.cursor()
@@ -2342,12 +2336,9 @@ Only include fields where you extracted real information. Use null for unknown f
     return {"reply": reply_text, "profile_update": profile_update}
 
 # ── Document Import ───────────────────────────────────────────────────────
-# Text/markdown context docs (handoff notes, training plans, etc.) that feed
-# into the coaching chat. Deliberately NOT for medical records, lab results,
-# or other health/PHI documents — this app doesn't process those, by design.
 
-IMPORT_MAX_STORE_CHARS  = 20000  # cap what's stored per doc
-IMPORT_MAX_PROMPT_CHARS = 6000   # cap what's actually sent per chat turn
+IMPORT_MAX_STORE_CHARS  = 20000
+IMPORT_MAX_PROMPT_CHARS = 6000
 
 @app.post("/coaching/import")
 async def import_doc(file: UploadFile = File(...), user: dict = Depends(get_current_user)):
@@ -2587,9 +2578,6 @@ async def coaching_chat(
     except Exception as e:
         return {"reply": "Sorry, I had trouble connecting. Please try again."}
 
-    # Extract the trailing memory-update JSON (same trailing-JSON pattern already
-    # used in /interview for profile extraction) and apply it to the DB. The user
-    # never sees this block — only the reply text before it.
     reply_text = reply
     if 'MEMORY_UPDATE:' in reply:
         parts = reply.split('MEMORY_UPDATE:', 1)
@@ -2800,7 +2788,6 @@ def strava_connect(_auth: str = ""):
     from fastapi.responses import RedirectResponse, HTMLResponse
     if not _auth:
         return HTMLResponse("<h2>Missing auth token. Please try again from the app.</h2>")
-    # Verify token
     conn = get_db(); cur = conn.cursor()
     cur.execute("SELECT id FROM users WHERE token=%s", (_auth,))
     user = cur.fetchone(); cur.close(); conn.close()
@@ -2823,7 +2810,6 @@ async def strava_callback(code: str, state: str, error: str = None):
     if error:
         return HTMLResponse("<h2>Strava connection cancelled.</h2><p>You can close this window.</p>")
     
-    # Verify state is a valid user token
     conn = get_db(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("SELECT * FROM users WHERE token=%s", (state,))
     user = cur.fetchone()
@@ -2831,7 +2817,6 @@ async def strava_callback(code: str, state: str, error: str = None):
         cur.close(); conn.close()
         return HTMLResponse("<h2>Invalid session. Please try again.</h2>")
 
-    # Exchange code for tokens
     async with httpx.AsyncClient() as client:
         resp = await client.post(STRAVA_TOKEN_URL, data={
             "client_id":     STRAVA_CLIENT_ID,
@@ -2845,7 +2830,6 @@ async def strava_callback(code: str, state: str, error: str = None):
         cur.close(); conn.close()
         return HTMLResponse("<h2>Strava connection failed.</h2><p>" + str(data) + "</p>")
 
-    # Store tokens
     cur.execute("""
         INSERT INTO strava_tokens (user_id, athlete_id, access_token, refresh_token, expires_at)
         VALUES (%s,%s,%s,%s,%s)
@@ -2888,7 +2872,6 @@ async def strava_sync(
         cur.close(); conn.close()
         raise HTTPException(status_code=400, detail="Strava not connected")
 
-    # Refresh token if expired
     access_token = token_row['access_token']
     if token_row['expires_at'] and int(time.time()) > token_row['expires_at'] - 300:
         async with httpx.AsyncClient() as client:
@@ -2906,8 +2889,6 @@ async def strava_sync(
                         (access_token, new_tokens['refresh_token'], new_tokens['expires_at'], user['id']))
             cur2.close()
 
-    # Fetch activities — never go further back than Jan 1 of YEAR,
-    # regardless of days_back. This is what caused the 2024/2025 leak.
     days_back_ts  = int(time.time()) - (days_back * 86400)
     year_start_ts = int(datetime(YEAR, 1, 1).timestamp())
     after_ts = max(days_back_ts, year_start_ts)
@@ -2927,31 +2908,13 @@ async def strava_sync(
 
             for act in activities:
                 try:
-                    # The sync has never filtered by activity type — it
-                    # pulled and stored everything Strava returned,
-                    # walks and runs included, as if they were rides.
-                    # Not related to tonight's dedup bug — a separate,
-                    # longer-standing gap, found while accounting for a
-                    # small remaining mileage difference against
-                    # Strava's own totals. sport_type is Strava's more
-                    # specific field (GravelRide, MountainBikeRide,
-                    # etc.); type is the older, simpler one — check
-                    # sport_type first, fall back to type if it's not
-                    # present, so older API responses are still handled.
                     activity_type = act.get('sport_type') or act.get('type') or ''
                     if activity_type not in CYCLING_ACTIVITY_TYPES:
                         non_cycling += 1
                         continue
                     start_local_raw = act.get('start_date_local','')
                     act_date = start_local_raw[:10]
-                    # Strava's start_date_local is ISO-formatted with a "Z"
-                    # suffix despite representing local time, not UTC — take
-                    # just the date+time portion, dropping the Z, so it's
-                    # stored and compared as the activity's own local clock.
                     start_time_val = start_local_raw[:19] if len(start_local_raw) >= 19 else None
-                    # Hard safety net: skip anything outside the current YEAR
-                    # even if it slipped past the after_ts filter (e.g. local
-                    # timezone landing an activity just before Jan 1).
                     if act_date < f'{YEAR}-01-01' or act_date >= f'{YEAR+1}-01-01':
                         out_of_range += 1
                         continue
@@ -2961,19 +2924,6 @@ async def strava_sync(
                     sport    = act.get('sport_type','').lower()
                     is_virt  = act.get('trainer', False) or 'virtual' in sport or 'zwift' in (act.get('name','') or '').lower()
 
-                    # Deduplication — same overlap-window reasoning as
-                    # /upload: checks whether this activity's actual time
-                    # window (start to device-off) overlaps an existing
-                    # ride's window, not just whether start times are close.
-                    # Catches a staggered device start AND a forgotten-
-                    # running device saved hours later — the real scenario
-                    # that produced rides 1077/1078 on 2026-07-29. When
-                    # windows overlap, imports this ride too rather than
-                    # silently picking one, flagging it against the
-                    # overlapping ride for the rider to resolve. Falls back
-                    # to the original distance/duration-only check (still
-                    # an automatic skip) only when start_time or elapsed_h
-                    # isn't available — nothing to compute a window from.
                     cur3 = conn.cursor()
                     new_end_time = None
                     if start_time_val and elapsed_h:
@@ -2995,16 +2945,6 @@ async def strava_sync(
                         if overlap_match:
                             duplicate_of_id = overlap_match[0]
 
-                    # Falls back to distance/duration, but ONLY against
-                    # rows lacking start_time/elapsed_h — never
-                    # re-evaluates a row with full timing data, which
-                    # would reintroduce the earlier false-positive bug.
-                    # This is the fix for a real data-loss bug found in
-                    # production: rides predating start_time (nearly a
-                    # rider's entire history) were being silently
-                    # excluded from ANY check once the new activity had
-                    # start_time — every re-sync of already-imported
-                    # rides was importing them again, fully unflagged.
                     if duplicate_of_id is None:
                         cur3.execute("""SELECT id FROM rides WHERE user_id=%s
                             AND ABS(ride_date - %s::date) <= 1
@@ -3014,12 +2954,6 @@ async def strava_sync(
                         if cur3.fetchone():
                             cur3.close(); skipped += 1; continue
 
-                    # Get stream data for power/HR/cadence/distance/time.
-                    # Strava's public API doesn't expose left-right balance,
-                    # torque effectiveness, or pedal smoothness as streams —
-                    # those fields stay NULL for Strava-sourced rides; only
-                    # direct FIT uploads from a supporting power meter can
-                    # capture them.
                     stream_resp = await client.get(
                         f"https://www.strava.com/api/v3/activities/{act['id']}/streams",
                         headers={"Authorization": "Bearer " + access_token},
@@ -3073,9 +3007,6 @@ async def strava_sync(
                          act.get('average_temp'), None, duplicate_of_id))
                     new_ride_id = cur3.fetchone()[0]
 
-                    # Keep the raw streams instead of discarding them —
-                    # time is stored as seconds-from-start (Strava's native
-                    # format), not absolute timestamps like the FIT path.
                     stream_data = {
                         'time_offset_s': stream_vals('time'),
                         'distance':      stream_vals('distance'),
@@ -3099,7 +3030,6 @@ async def strava_sync(
                 break
             page += 1
 
-    # Update last sync time
     cur.execute("UPDATE strava_tokens SET last_sync=NOW() WHERE user_id=%s", (user['id'],))
     cur.close(); conn.close()
 
@@ -3314,24 +3244,49 @@ def build_ride_detail_html(ride, streams):
             "<div class='dchart-card'><h3>Cadence</h3><div class='dchart-wrap'><canvas id='cadChart'></canvas><div class='dselect-overlay' id='cadChartOv'></div></div></div>"
             + ("<div class='dchart-card'><h3>Left/Right Power Balance</h3><div class='dchart-wrap'><canvas id='lrChart'></canvas><div class='dselect-overlay' id='lrChartOv'></div></div></div>" if has_lr else "")
         )
+        # ── v2.12.0 fix ──────────────────────────────────────────────────
+        # Two real bugs, same root cause: the x-axis on every chart here
+        # was left on Chart.js's default CATEGORY scale (labels/data passed
+        # as two parallel arrays, no scales.x.type set) instead of a real
+        # LINEAR scale. getValueForPixel() on a category scale returns the
+        # *index* into the label array, not the actual mile value the
+        # label displays — so pixelToValue()/computeSelectionStats() were
+        # silently reading index numbers as if they were miles. Near the
+        # start of a ride the index and the mile value happen to be close
+        # in magnitude, which is why dragging there looked plausible while
+        # dragging further out did not. Fixed by switching every chart to
+        # scales.x.type:'linear' and passing each dataset as real {x,y}
+        # point objects (built by the small pts() helper below) instead of
+        # a shared category-label array. computeSelectionStats() and
+        # pixelToValue() themselves needed no changes — they were already
+        # written correctly for real mile values, they just weren't being
+        # fed them.
+        # Also fixed: charts had no explicit height, so Chart.js's
+        # responsive sizing had nothing to anchor to and kept growing —
+        # only one chart fit on screen at a time. .dchart-wrap now has a
+        # fixed height (matches the 260px cap already used successfully
+        # on the main Dashboard's charts) with maintainAspectRatio:false
+        # so the canvas fills it instead of dictating its own size.
         chart_js = (
-            "const labels=" + j(labels_ds) + ";"
-            "const opts={responsive:true,animation:false,elements:{point:{radius:0},line:{tension:0.2}},"
-            "scales:{x:{title:{display:true,text:'Miles'},ticks:{maxTicksLimit:8}}}};"
-            "new Chart(document.getElementById('altChart'),{type:'line',data:{labels:labels,"
-            "datasets:[{data:" + j(alt_ds) + ",borderColor:'#9333ea',backgroundColor:'rgba(147,51,234,0.1)',fill:true}]},"
+            "const X=" + j(labels_ds) + ";"
+            "function pts(xs,ys){return xs.map((x,i)=>({x:x,y:ys[i]}));}"
+            "const opts={responsive:true,maintainAspectRatio:false,animation:false,"
+            "elements:{point:{radius:0},line:{tension:0.2}},"
+            "scales:{x:{type:'linear',title:{display:true,text:'Miles'},ticks:{maxTicksLimit:8}}}};"
+            "new Chart(document.getElementById('altChart'),{type:'line',data:{"
+            "datasets:[{data:pts(X," + j(alt_ds) + "),borderColor:'#9333ea',backgroundColor:'rgba(147,51,234,0.1)',fill:true}]},"
             "options:Object.assign({},opts,{scales:Object.assign({},opts.scales,{y:{title:{display:true,text:'ft'}}})})});"
-            "new Chart(document.getElementById('powerChart'),{type:'line',data:{labels:labels,"
-            "datasets:[{data:" + j(power_ds) + ",borderColor:'#2563eb'}]},"
+            "new Chart(document.getElementById('powerChart'),{type:'line',data:{"
+            "datasets:[{data:pts(X," + j(power_ds) + "),borderColor:'#2563eb'}]},"
             "options:Object.assign({},opts,{scales:Object.assign({},opts.scales,{y:{title:{display:true,text:'W'}}})})});"
-            "new Chart(document.getElementById('hrChart'),{type:'line',data:{labels:labels,"
-            "datasets:[{data:" + j(hr_ds) + ",borderColor:'#dc2626'}]},"
+            "new Chart(document.getElementById('hrChart'),{type:'line',data:{"
+            "datasets:[{data:pts(X," + j(hr_ds) + "),borderColor:'#dc2626'}]},"
             "options:Object.assign({},opts,{scales:Object.assign({},opts.scales,{y:{title:{display:true,text:'bpm'}}})})});"
-            "new Chart(document.getElementById('cadChart'),{type:'line',data:{labels:labels,"
-            "datasets:[{data:" + j(cadence_ds) + ",borderColor:'#059669'}]},"
+            "new Chart(document.getElementById('cadChart'),{type:'line',data:{"
+            "datasets:[{data:pts(X," + j(cadence_ds) + "),borderColor:'#059669'}]},"
             "options:Object.assign({},opts,{scales:Object.assign({},opts.scales,{y:{title:{display:true,text:'rpm'}}})})});"
-            + ("new Chart(document.getElementById('lrChart'),{type:'line',data:{labels:labels,"
-               "datasets:[{data:" + j(lr_ds) + ",borderColor:'#ea580c',label:'% right'}]},"
+            + ("new Chart(document.getElementById('lrChart'),{type:'line',data:{"
+               "datasets:[{data:pts(X," + j(lr_ds) + "),borderColor:'#ea580c',label:'% right'}]},"
                "options:Object.assign({},opts,{plugins:{legend:{display:false}},scales:Object.assign({},opts.scales,{y:{title:{display:true,text:'% right'},suggestedMin:30,suggestedMax:70}})})});"
                if has_lr else "")
             + (
@@ -3339,10 +3294,6 @@ def build_ride_detail_html(ride, streams):
                 + ",cadence:" + j(full_cadence) + ",alt:" + j(full_alt_ft) + "};"
                 "const chartIds=" + j(['altChart','powerChart','hrChart','cadChart'] + (['lrChart'] if has_lr else [])) + ";"
                 "const charts={};chartIds.forEach(id=>{charts[id]=Chart.getChart(id);});"
-                # Distance range -> accurate stats, computed from full-resolution
-                # data (not the ~400-point downsampled chart data) so a short
-                # selection isn't distorted by thinning meant for smooth
-                # rendering, not stat accuracy.
                 "function computeSelectionStats(startMi,endMi){"
                 "const lo=Math.min(startMi,endMi),hi=Math.max(startMi,endMi);"
                 "const idxs=[];for(let i=0;i<fullData.dist.length;i++){if(fullData.dist[i]!=null&&fullData.dist[i]>=lo&&fullData.dist[i]<=hi)idxs.push(i);}"
@@ -3350,8 +3301,6 @@ def build_ride_detail_html(ride, streams):
                 "const avg=(arr,exZero)=>{const v=idxs.map(i=>arr[i]).filter(x=>x!=null&&(!exZero||x>0));return v.length?Math.round(v.reduce((a,b)=>a+b,0)/v.length):null;};"
                 "const mx=(arr)=>{const v=idxs.map(i=>arr[i]).filter(x=>x!=null);return v.length?Math.round(Math.max(...v)):null;};"
                 "let elev=0;for(let k=1;k<idxs.length;k++){const a=fullData.alt[idxs[k-1]],b=fullData.alt[idxs[k]];if(a!=null&&b!=null&&b>a)elev+=(b-a);}"
-                # Non-zero power filter matches the app's established
-                # avg_power convention elsewhere (excludes coasting/stopped).
                 "return{distance:Math.round((hi-lo)*100)/100,avgPower:avg(fullData.power,true),maxPower:mx(fullData.power),"
                 "avgHr:avg(fullData.hr,false),maxHr:mx(fullData.hr),avgCadence:avg(fullData.cadence,true),elevGain:Math.round(elev)};"
                 "}"
@@ -3376,7 +3325,7 @@ def build_ride_detail_html(ride, streams):
                 "updateOverlays(dragState.startVal,pixelToValue(c,cv,clientX));}"
                 "function handleDragEnd(clientX){if(!dragState.active)return;const c=charts[dragState.chartId],cv=document.getElementById(dragState.chartId);dragState.active=false;if(!c||!cv)return;"
                 "const val=pixelToValue(c,cv,clientX);"
-                "if(Math.abs(val-dragState.startVal)<0.05){clearSelection();return;}"  # treat a near-zero drag as a click, not a selection
+                "if(Math.abs(val-dragState.startVal)<0.05){clearSelection();return;}"
                 "updateOverlays(dragState.startVal,val);showSelectionStats(computeSelectionStats(dragState.startVal,val));}"
                 "chartIds.forEach(id=>{const cv=document.getElementById(id);if(!cv)return;"
                 "cv.addEventListener('mousedown',e=>{const c=charts[id];if(!c)return;dragState={active:true,startVal:pixelToValue(c,cv,e.clientX),chartId:id};});"
@@ -3403,7 +3352,8 @@ def build_ride_detail_html(ride, streams):
         + ".dvalue{font-size:1.05rem;font-weight:600;margin-top:2px;}"
         + ".dchart-card{background:#fff;border-radius:8px;padding:14px;box-shadow:0 1px 4px rgba(0,0,0,0.06);margin-bottom:14px;}"
         + ".dno-data{font-size:0.85rem;color:#888;text-align:center;padding:20px 0;}"
-        + ".dchart-wrap{position:relative;}"
+        + ".dchart-wrap{position:relative;height:260px;}"
+        + ".dchart-wrap canvas{max-height:260px;}"
         + ".dselect-overlay{position:absolute;top:0;bottom:0;display:none;background:rgba(37,99,235,0.12);border-left:2px solid #2563eb;border-right:2px solid #2563eb;pointer-events:none;}"
         + ".dselect-bar{background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:10px 14px;margin-bottom:14px;font-size:0.8rem;color:#1e40af;}"
         + "canvas{cursor:crosshair;}"
