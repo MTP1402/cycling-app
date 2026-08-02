@@ -1,11 +1,49 @@
 # ═══════════════════════════════════════════════════════════════════
 # CYCLING COACH API — main.py
 #
-# VERSION: 2.16.0  (2026-08-03)
+# VERSION: 2.17.0  (2026-08-03)
 # Check this against GET / on the live Railway URL before assuming
 # a deploy has actually landed — the two should always match.
 #
 # CHANGELOG
+#   2.17.0 (2026-08-03) — extended POST /coaching/import to accept .pdf
+#                         and .docx alongside the existing .txt/.md,
+#                         per explicit request. New extract_pdf_text()
+#                         (pypdf, page-by-page) and extract_docx_text()
+#                         (python-docx, paragraph-by-paragraph, blank
+#                         paragraphs filtered). Routes by file extension
+#                         before falling through to the existing plain-
+#                         text decode path, which is otherwise
+#                         unchanged. .doc (the older pre-2007 binary
+#                         Word format) is explicitly rejected with a
+#                         clear message rather than attempted — it's a
+#                         completely different file structure that
+#                         python-docx doesn't read, not just an older
+#                         version of the same thing. A scanned/
+#                         photographed PDF with no real text layer
+#                         extracts to empty and hits the existing
+#                         empty-file check with a message explaining
+#                         why, rather than silently importing nothing.
+#                         NEW DEPENDENCIES: requires pypdf and python-
+#                         docx added to requirements.txt on GitHub —
+#                         same situation as openpyxl in 2.6.0, not
+#                         something addable from here since only
+#                         main.py and cycling_coach_app.html are ever
+#                         in front of me, not the actual requirements
+#                         file. Deploy will fail with a missing-module
+#                         error until both are added.
+#                         Tested before shipping, not just assumed to
+#                         work: installed both libraries locally and
+#                         ran real generated files through the actual
+#                         extraction functions — a genuine multi-page
+#                         PDF (both pages' text confirmed present) and
+#                         a genuine .docx (blank paragraphs confirmed
+#                         filtered, real content confirmed present);
+#                         garbage/malformed input for both confirmed to
+#                         raise a catchable exception rather than crash
+#                         silently; a text-less PDF confirmed to
+#                         extract to empty and correctly trip the
+#                         existing empty-file check.
 #   2.16.0 (2026-08-03) — added image import for coaching context (the
 #                         "photo of an energy gel" use case flagged in
 #                         the handoff doc). New POST /coaching/import-
@@ -892,7 +930,7 @@
 #   1.0.0                initial live build — dashboard, FIT upload,
 #                         Strava OAuth + sync, AI profile interview
 # ═══════════════════════════════════════════════════════════════════
-APP_VERSION = "2.16.0"
+APP_VERSION = "2.17.0"
 ADMIN_EMAILS = {"mtpujol@gmail.com"}
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Form
@@ -2600,24 +2638,74 @@ Only include fields where you extracted real information. Use null for unknown f
 IMPORT_MAX_STORE_CHARS  = 20000
 IMPORT_MAX_PROMPT_CHARS = 6000
 
+def extract_pdf_text(data):
+    """Extract embedded text from a PDF, page by page. Only pulls text
+    that's actually present in the PDF's own text layer — a scanned or
+    photographed PDF with no OCR'd text layer will extract to nothing,
+    which the caller treats the same as any other empty upload (clear
+    error, not a silent "success" with nothing stored). Requires pypdf,
+    a new dependency not previously needed by this app — see the note
+    on requirements.txt in the changelog for this version."""
+    from pypdf import PdfReader
+    from io import BytesIO
+    reader = PdfReader(BytesIO(data))
+    pages_text = []
+    for page in reader.pages:
+        t = page.extract_text() or ''
+        if t.strip():
+            pages_text.append(t)
+    return '\n\n'.join(pages_text)
+
+def extract_docx_text(data):
+    """Extract paragraph text from a modern Word document. Only .docx
+    (the XML-based format Word has used since 2007) — the older binary
+    .doc format uses a completely different file structure and isn't
+    supported by this. Requires python-docx, a new dependency — see the
+    requirements.txt note in the changelog for this version."""
+    import docx
+    from io import BytesIO
+    doc = docx.Document(BytesIO(data))
+    paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
+    return '\n'.join(paragraphs)
+
 @app.post("/coaching/import")
 async def import_doc(file: UploadFile = File(...), user: dict = Depends(get_current_user)):
-    """Upload a text/markdown document as context for the coaching chat.
-    Not for medical records, lab results, or other health/PHI documents."""
+    """Upload a document as context for the coaching chat — .txt, .md,
+    .pdf, or .docx (not the older .doc format). Not for medical records,
+    lab results, or other health/PHI documents."""
     data = await file.read()
-    # v2.15.0 fix: errors='ignore' silently drops invalid bytes instead of
-    # raising, so decode() could never actually fail — the "could not read
-    # as text" validation below was genuinely unreachable dead code, not
-    # just theoretically so. Dropped 'ignore' so a real non-text upload
-    # (an image, a PDF, etc.) now raises UnicodeDecodeError and actually
-    # hits the intended error path, instead of silently importing mangled
-    # garbage text as if it had succeeded.
-    try:
-        text = data.decode('utf-8')
-    except UnicodeDecodeError:
-        raise HTTPException(status_code=400, detail="Could not read as text. .txt and .md files only for now.")
+    filename_lower = (file.filename or '').lower()
+
+    if filename_lower.endswith('.pdf'):
+        try:
+            text = extract_pdf_text(data)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail="Could not read this PDF: " + str(e))
+    elif filename_lower.endswith('.docx'):
+        try:
+            text = extract_docx_text(data)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail="Could not read this Word document: " + str(e))
+    elif filename_lower.endswith('.doc'):
+        # Deliberately rejected with a clear message rather than attempted
+        # and silently failing — .doc (the pre-2007 binary format) needs a
+        # different library entirely; not supported here.
+        raise HTTPException(status_code=400,
+            detail="The older .doc format isn't supported — please save as .docx and re-upload.")
+    else:
+        # v2.15.0 fix carried forward: errors='ignore' used to silently drop
+        # invalid bytes instead of raising, making the validation below
+        # unreachable dead code. Left fixed (strict decode, catch
+        # UnicodeDecodeError) as file types expand here.
+        try:
+            text = data.decode('utf-8')
+        except UnicodeDecodeError:
+            raise HTTPException(status_code=400,
+                detail="Could not read as text. .txt, .md, .pdf, or .docx files only.")
+
     if not text.strip():
-        raise HTTPException(status_code=400, detail="File appears to be empty.")
+        raise HTTPException(status_code=400,
+            detail="No readable text found in this file — a scanned/photographed PDF with no real text layer won't have anything to extract.")
     truncated = len(text) > IMPORT_MAX_STORE_CHARS
     text = text[:IMPORT_MAX_STORE_CHARS]
     conn = get_db(); cur = conn.cursor()
