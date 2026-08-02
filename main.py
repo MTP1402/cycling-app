@@ -1,11 +1,63 @@
 # ═══════════════════════════════════════════════════════════════════
 # CYCLING COACH API — main.py
 #
-# VERSION: 2.14.0  (2026-08-03)
+# VERSION: 2.16.0  (2026-08-03)
 # Check this against GET / on the live Railway URL before assuming
 # a deploy has actually landed — the two should always match.
 #
 # CHANGELOG
+#   2.16.0 (2026-08-03) — added image import for coaching context (the
+#                         "photo of an energy gel" use case flagged in
+#                         the handoff doc). New POST /coaching/import-
+#                         image, accepting up to 4 images at once (e.g.
+#                         front + back of the same packet) — sends them
+#                         to the AI for a description, extracting
+#                         product identity and any visible nutrition
+#                         facts (calories, carbs, sodium/electrolytes)
+#                         when it's food/nutrition packaging. Only the
+#                         resulting text description is stored, into
+#                         the same imported_docs table the existing
+#                         text importer already uses — the image bytes
+#                         themselves are sent for analysis and then
+#                         discarded, never written to disk or the
+#                         database. Deliberate scope decision, per
+#                         explicit direction: no image storage, no new
+#                         blob/file-storage strategy — this keeps the
+#                         app's storage model exactly as it's always
+#                         been (text in Postgres, nothing else).
+#                         Frontend: new "Import a photo for your coach"
+#                         card on the Coaching page, same section as
+#                         the existing text importer, sharing its
+#                         results list (loadImports()) since both write
+#                         to the same table.
+#                         Tested before shipping: validation logic
+#                         (image count cap, disallowed file type,
+#                         oversized file, empty upload) run directly
+#                         against representative fake inputs; base64
+#                         encode/decode round-trip verified byte-exact
+#                         against the original data, confirming nothing
+#                         gets corrupted on the way to the API call.
+#   2.15.0 (2026-08-03) — fixed the known dead-code issue in the text-
+#                         import endpoint, flagged in the handoff doc
+#                         as a real but minor gap: it decoded uploads
+#                         with errors='ignore', which silently drops
+#                         invalid bytes instead of raising — meaning
+#                         its own "could not read as text" validation
+#                         could never actually trigger, regardless of
+#                         what got uploaded. In practice this meant a
+#                         non-text file (an image, a PDF, anything
+#                         binary) would silently "succeed" and get
+#                         stored as mangled garbage text rather than
+#                         being rejected with a clear error. Removed
+#                         errors='ignore' and narrowed the except
+#                         clause to UnicodeDecodeError specifically,
+#                         so the validation path is now genuinely
+#                         reachable. Verified directly: fed the old and
+#                         new logic real binary data (JPEG magic
+#                         bytes) side by side — old logic silently
+#                         "succeeded" with mangled text, new logic
+#                         correctly rejects it; real UTF-8 text
+#                         uploads behave identically before and after.
 #   2.14.0 (2026-08-03) — four pieces built together tonight, all
 #                         extending the power-curve foundation from
 #                         2.13.x or the existing flagged-duplicate
@@ -840,7 +892,7 @@
 #   1.0.0                initial live build — dashboard, FIT upload,
 #                         Strava OAuth + sync, AI profile interview
 # ═══════════════════════════════════════════════════════════════════
-APP_VERSION = "2.14.0"
+APP_VERSION = "2.16.0"
 ADMIN_EMAILS = {"mtpujol@gmail.com"}
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Form
@@ -856,6 +908,8 @@ import json
 import re
 import html
 import tempfile
+import base64
+from typing import List
 from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
 from collections import defaultdict
@@ -2551,9 +2605,16 @@ async def import_doc(file: UploadFile = File(...), user: dict = Depends(get_curr
     """Upload a text/markdown document as context for the coaching chat.
     Not for medical records, lab results, or other health/PHI documents."""
     data = await file.read()
+    # v2.15.0 fix: errors='ignore' silently drops invalid bytes instead of
+    # raising, so decode() could never actually fail — the "could not read
+    # as text" validation below was genuinely unreachable dead code, not
+    # just theoretically so. Dropped 'ignore' so a real non-text upload
+    # (an image, a PDF, etc.) now raises UnicodeDecodeError and actually
+    # hits the intended error path, instead of silently importing mangled
+    # garbage text as if it had succeeded.
     try:
-        text = data.decode('utf-8', errors='ignore')
-    except Exception:
+        text = data.decode('utf-8')
+    except UnicodeDecodeError:
         raise HTTPException(status_code=400, detail="Could not read as text. .txt and .md files only for now.")
     if not text.strip():
         raise HTTPException(status_code=400, detail="File appears to be empty.")
@@ -2565,6 +2626,83 @@ async def import_doc(file: UploadFile = File(...), user: dict = Depends(get_curr
     doc_id = cur.fetchone()[0]; cur.close(); conn.close()
     return {"status": "imported", "id": doc_id, "filename": file.filename,
             "chars": len(text), "truncated": truncated}
+
+IMPORT_IMAGE_MAX_COUNT = 4
+IMPORT_IMAGE_MAX_BYTES = 8_000_000  # ~8MB per image, keeps the API request reasonable
+IMPORT_IMAGE_ALLOWED_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+
+@app.post("/coaching/import-image")
+async def import_image(files: List[UploadFile] = File(...), user: dict = Depends(get_current_user)):
+    """Read one or more images (e.g. front + back of a gel packet or
+    nutrition label) and have the AI describe/extract from them — product
+    identity, calories, carbs, electrolytes, whatever's actually legible
+    and relevant for coaching context.
+
+    Deliberately no image storage: the bytes are sent to the AI for
+    analysis and then discarded — never written to disk or the database.
+    Only the resulting text description is saved, into the same
+    imported_docs table the text importer above already uses, so it flows
+    into coaching chat context exactly the same way an imported document
+    does. This keeps the app's storage model exactly as it's always been
+    (text in Postgres, nothing else) rather than adding a whole separate
+    blob/file-storage strategy for a feature that only ever needed the
+    description, not the photo itself."""
+    if not ANTHROPIC_KEY:
+        raise HTTPException(status_code=503, detail="AI unavailable")
+    if not files:
+        raise HTTPException(status_code=400, detail="Please attach at least one image")
+    if len(files) > IMPORT_IMAGE_MAX_COUNT:
+        raise HTTPException(status_code=400, detail=f"Please attach at most {IMPORT_IMAGE_MAX_COUNT} images at a time")
+
+    content_blocks = []
+    filenames = []
+    for f in files:
+        media_type = f.content_type if f.content_type in IMPORT_IMAGE_ALLOWED_TYPES else None
+        if not media_type:
+            raise HTTPException(status_code=400,
+                detail=f"{f.filename}: only JPEG, PNG, WEBP, or GIF images are supported")
+        data = await f.read()
+        if len(data) > IMPORT_IMAGE_MAX_BYTES:
+            raise HTTPException(status_code=400,
+                detail=f"{f.filename} is too large (max {IMPORT_IMAGE_MAX_BYTES // 1_000_000}MB per image)")
+        b64 = base64.b64encode(data).decode('ascii')
+        content_blocks.append({"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}})
+        filenames.append(f.filename)
+
+    content_blocks.append({"type": "text", "text": (
+        "Describe what's shown in this image (or images — e.g. front and back of the same "
+        "item). If it's food/nutrition packaging (an energy gel, bar, drink mix, etc.), extract "
+        "the product name and, if visible, calories, carbohydrates (g), sodium/electrolytes (mg), "
+        "and any other nutrition facts shown. If it's something else relevant to cycling coaching "
+        "context, describe it plainly. Keep the description factual and concise — a few sentences "
+        "plus any extracted numbers, not a long analysis."
+    )})
+
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01"},
+                json={"model": "claude-sonnet-4-6", "max_tokens": 500,
+                      "messages": [{"role": "user", "content": content_blocks}]},
+                timeout=45
+            )
+            resp_data = resp.json()
+            description = ''.join(
+                b.get('text', '') for b in resp_data.get('content', []) if b.get('type') == 'text'
+            ).strip()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail="Image analysis request failed: " + str(e))
+
+    if not description:
+        raise HTTPException(status_code=502, detail="Could not get a description from the image(s) — try again")
+
+    combined_name = " + ".join(filenames)
+    conn = get_db(); cur = conn.cursor()
+    cur.execute("INSERT INTO imported_docs (user_id, filename, content) VALUES (%s,%s,%s) RETURNING id",
+                (user['id'], combined_name, description))
+    doc_id = cur.fetchone()[0]; cur.close(); conn.close()
+    return {"status": "imported", "id": doc_id, "filename": combined_name, "description": description}
 
 @app.get("/coaching/imports")
 def list_imports(user: dict = Depends(get_current_user)):
