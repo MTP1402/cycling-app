@@ -1,11 +1,64 @@
 # ═══════════════════════════════════════════════════════════════════
 # CYCLING COACH API — main.py
 #
-# VERSION: 2.9.0  (2026-07-29)
+# VERSION: 2.9.2  (2026-08-02)
 # Check this against GET / on the live Railway URL before assuming
 # a deploy has actually landed — the two should always match.
 #
 # CHANGELOG
+#   2.9.2 (2026-08-02) — added GET /rides/audit-duplicates, a one-time
+#                         read-only diagnostic to find rides matching
+#                         the exact pattern the v2.8.0 bug (fixed in
+#                         2.9.1) created — a freshly re-synced ride
+#                         paired with the older pre-existing ride it
+#                         duplicated. Surfaces candidates for review;
+#                         doesn't delete anything on its own.
+#   2.9.1 (2026-08-02) — CRITICAL FIX: a real data-loss bug introduced
+#                         by the v2.8.0 overlap-based dedup redesign.
+#                         That version required the EXISTING candidate
+#                         row to also have start_time/elapsed_h to be
+#                         considered a possible duplicate at all — but
+#                         start_time only began being populated
+#                         partway through that same session, meaning
+#                         essentially a rider's entire ride history
+#                         predating it has start_time=NULL. The moment
+#                         a newly-synced Strava activity had its own
+#                         start_time (which is nearly always, since
+#                         Strava provides it directly), the dedup
+#                         check would find zero matches against ANY
+#                         older row — not because no duplicate
+#                         existed, but because the query structurally
+#                         excluded rows lacking start_time from ever
+#                         matching, with no fallback. Every re-sync of
+#                         already-imported rides was silently creating
+#                         full duplicates, completely unflagged.
+#                         Confirmed in production: Strava itself
+#                         showed 100 activities / 2,999.6 mi for the
+#                         year; the app showed 141 rides / 3,924.6 mi
+#                         — 41 extra rides, ~925 extra miles.
+#                         Fixed by making the fallback decision
+#                         per-candidate-row instead of once globally:
+#                         the distance/duration check now explicitly
+#                         runs against rows lacking start_time/
+#                         elapsed_h (exactly the rows overlap can't
+#                         evaluate), while rows that DO have full
+#                         timing data are only ever compared via
+#                         overlap — never re-evaluated by distance/
+#                         duration, which is what would reintroduce
+#                         the earlier false-positive bug from the same
+#                         session. Re-tested all three critical cases
+#                         together before shipping: the actual bug
+#                         scenario (now caught via fallback, skipped
+#                         silently — matching the original long-
+#                         standing behavior for exact-match dupes),
+#                         the earlier false-positive case (still
+#                         correctly not flagged), and the original
+#                         overlap scenario (staggered start + forgotten
+#                         stop — still correctly flagged for review,
+#                         not silently skipped).
+#                         Does NOT retroactively clean up rides already
+#                         wrongly duplicated before this fix — that's a
+#                         separate, deliberate cleanup step.
 #   2.9.0 (2026-07-29) — added drag-select-to-recompute on the ride-
 #                         detail page, the last deferred piece from
 #                         that original build. Drag across any chart
@@ -539,7 +592,7 @@
 #   1.0.0                initial live build — dashboard, FIT upload,
 #                         Strava OAuth + sync, AI profile interview
 # ═══════════════════════════════════════════════════════════════════
-APP_VERSION = "2.9.0"
+APP_VERSION = "2.9.2"
 ADMIN_EMAILS = {"mtpujol@gmail.com"}
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Form
@@ -1858,9 +1911,21 @@ async def upload_fit(file: UploadFile = File(...), notes: str = Form(default="")
         overlap_match = cur.fetchone()
         if overlap_match:
             duplicate_of_id = overlap_match[0]
-    else:
+
+    # Falls back to the original distance/duration check, but ONLY
+    # against rows that lack start_time/elapsed_h — never re-evaluates a
+    # row that HAS full timing data, which is what would reintroduce the
+    # false-positive bug already found and fixed once tonight. This is
+    # the actual fix for a real data-loss bug found in production: rows
+    # from before start_time existed (i.e. nearly all of a rider's
+    # history predating this feature) were being silently excluded from
+    # ANY duplicate check once the new ride had start_time — meaning
+    # every re-sync of already-imported activities was importing them
+    # again, completely unflagged, with no fallback at all.
+    if duplicate_of_id is None:
         cur.execute("""SELECT id FROM rides WHERE user_id=%s
             AND ABS(ride_date - %s::date) <= 1
+            AND (start_time IS NULL OR elapsed_h IS NULL)
             AND ABS(COALESCE(dist_mi,0)-%s)<0.5 AND ABS(COALESCE(duration_h,0)-%s)<0.1""",
             (user['id'], metrics['ride_date'], metrics.get('dist_mi') or 0, metrics.get('duration_h') or 0))
         existing = cur.fetchone()
@@ -2845,9 +2910,21 @@ async def strava_sync(
                         overlap_match = cur3.fetchone()
                         if overlap_match:
                             duplicate_of_id = overlap_match[0]
-                    else:
+
+                    # Falls back to distance/duration, but ONLY against
+                    # rows lacking start_time/elapsed_h — never
+                    # re-evaluates a row with full timing data, which
+                    # would reintroduce the earlier false-positive bug.
+                    # This is the fix for a real data-loss bug found in
+                    # production: rides predating start_time (nearly a
+                    # rider's entire history) were being silently
+                    # excluded from ANY check once the new activity had
+                    # start_time — every re-sync of already-imported
+                    # rides was importing them again, fully unflagged.
+                    if duplicate_of_id is None:
                         cur3.execute("""SELECT id FROM rides WHERE user_id=%s
                             AND ABS(ride_date - %s::date) <= 1
+                            AND (start_time IS NULL OR elapsed_h IS NULL)
                             AND ABS(COALESCE(dist_mi,0)-%s)<0.5 AND ABS(COALESCE(duration_h,0)-%s)<0.1""",
                             (user['id'], act_date, dist_mi, dur_h))
                         if cur3.fetchone():
@@ -2964,6 +3041,41 @@ def delete_ride(ride_id: int, user: dict = Depends(get_current_user)):
     if not deleted:
         raise HTTPException(status_code=404, detail="Ride not found")
     return {"status": "deleted", "id": ride_id}
+
+@app.get("/rides/audit-duplicates")
+def audit_duplicates(user: dict = Depends(get_current_user)):
+    """One-time diagnostic for the v2.9.1 fix — finds the specific
+    pattern the bug created: a freshly re-synced ride (has start_time)
+    paired with an older, pre-existing ride (no start_time, predates
+    that column) for what's almost certainly the same physical
+    activity — same date, near-identical distance and duration.
+    Tighter tolerance than the normal dedup check (0.3mi/3min, not
+    0.5mi/6min) since these should be exact re-imports of the same
+    source data, not just similar rides. Read-only — surfaces
+    candidates for review, deletes nothing itself."""
+    conn = get_db(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("""
+        SELECT
+            old.id AS old_id, old.ride_date AS old_date, old.name AS old_name,
+            old.dist_mi AS old_dist, old.duration_h AS old_duration,
+            old.avg_power AS old_avg_power, old.avg_hr AS old_avg_hr,
+            new.id AS new_id, new.ride_date AS new_date, new.name AS new_name,
+            new.dist_mi AS new_dist, new.duration_h AS new_duration,
+            new.avg_power AS new_avg_power, new.avg_hr AS new_avg_hr
+        FROM rides old
+        JOIN rides new ON new.user_id = old.user_id
+            AND new.id != old.id
+            AND old.start_time IS NULL
+            AND new.start_time IS NOT NULL
+            AND ABS(old.ride_date - new.ride_date) <= 1
+            AND ABS(COALESCE(old.dist_mi,0) - COALESCE(new.dist_mi,0)) < 0.3
+            AND ABS(COALESCE(old.duration_h,0) - COALESCE(new.duration_h,0)) < 0.05
+        WHERE old.user_id = %s
+        ORDER BY old.ride_date DESC
+    """, (user['id'],))
+    pairs = [dict(r) for r in cur.fetchall()]
+    cur.close(); conn.close()
+    return {"pairs": pairs, "count": len(pairs)}
 
 @app.get("/rides/flagged")
 def get_flagged_rides(user: dict = Depends(get_current_user)):
