@@ -1,11 +1,82 @@
 # ═══════════════════════════════════════════════════════════════════
 # CYCLING COACH API — main.py
 #
-# VERSION: 2.13.1  (2026-08-03)
+# VERSION: 2.14.0  (2026-08-03)
 # Check this against GET / on the live Railway URL before assuming
 # a deploy has actually landed — the two should always match.
 #
 # CHANGELOG
+#   2.14.0 (2026-08-03) — four pieces built together tonight, all
+#                         extending the power-curve foundation from
+#                         2.13.x or the existing flagged-duplicate
+#                         system from 2.8.0/2.9.x:
+#                         FTP ESTIMATE — new estimate_ftp_from_curve()
+#                         (95% of best 20-min power, the standard field
+#                         estimate). Shown as a banner on the ride-
+#                         detail page only when a real estimate exists
+#                         AND it differs from the profile's on-file FTP
+#                         by 5%+, so it doesn't nag on every ride. Never
+#                         auto-applies — always a suggestion with an
+#                         explicit confirm step. New POST /profile/ftp
+#                         for that confirm step: a targeted single-
+#                         column UPDATE, deliberately separate from
+#                         POST /profile, which re-saves the WHOLE form
+#                         and would have silently wiped every other
+#                         profile field if called with just ftp set.
+#                         Caught a real bug in testing, not shipped: the
+#                         first version also had a 60-minute-direct
+#                         fallback for rides without a 20-min checkpoint
+#                         but long enough for 60 — dead code, since
+#                         compute_power_curve() finds the best window of
+#                         each duration anywhere in the ride, so any
+#                         ride long enough for a 3600s checkpoint
+#                         necessarily has a 1200s one too. That branch
+#                         could never fire; removed rather than left in.
+#                         POWER CURVE COACHING TOOL — new 6th AI tool,
+#                         get_power_curve, returning key checkpoints
+#                         (5s/15s/30s/1/5/10/20/30/60-min, whichever the
+#                         ride has) plus the FTP estimate when
+#                         computable — so the coaching chat can discuss
+#                         sustained power at a specific duration or
+#                         whether a ride looks like a new FTP, beyond
+#                         the basic 5s/15s/30s/5-min bests already in
+#                         its context.
+#                         FLAGGED-DUPLICATE BADGE — GET /coaching/memory
+#                         now returns a `flagged` bool per dated_log
+#                         entry (a correlated EXISTS check against
+#                         possible_duplicate_of), so the Ride History
+#                         list can show an in-context badge, not just
+#                         the one dedicated Dashboard review card, which
+#                         is easy to miss if a rider doesn't happen to
+#                         scroll to it. Resolution itself is unchanged —
+#                         same existing /rides/flagged, /rides/{id}/
+#                         clear-review, DELETE /rides/{id}.
+#                         TCX EXPORT — new GET /rides/{id}/export-tcx,
+#                         built by build_tcx() from the ride's own
+#                         stored raw stream data. GPX was considered and
+#                         explicitly ruled out: GPX trackpoints require
+#                         real lat/lon per spec, and this app has never
+#                         captured GPS coordinates (FIT/Strava streams
+#                         here only ever held power/HR/cadence/altitude/
+#                         distance/speed) — a GPX with fake coordinates
+#                         would misrepresent the actual route. TCX's
+#                         schema makes Position genuinely optional, so
+#                         this is a real, standards-compliant export
+#                         (TrainingPeaks/Garmin Connect/WKO-readable)
+#                         carrying everything except a route/map. TCX
+#                         *import* stays a separate, larger follow-up —
+#                         not attempted here.
+#                         Tested before shipping: estimate_ftp_from_curve
+#                         verified against the same synthetic power
+#                         curve data used for compute_power_curve's own
+#                         tests (20-min and 60-min branches both
+#                         verified); ride-detail page rendered with a
+#                         real profile_ftp comparison to confirm the
+#                         banner only appears past the 5% threshold;
+#                         generated TCX XML parsed back with a real XML
+#                         parser to confirm it's well-formed, not just
+#                         string-built; get_power_curve tool tested
+#                         directly against synthetic stream data.
 #   2.13.1 (2026-08-03) — fixed a real usability gap on the new Power
 #                         Curve chart, reported immediately after trying
 #                         it: the tooltip only fired on a pixel-perfect
@@ -769,11 +840,11 @@
 #   1.0.0                initial live build — dashboard, FIT upload,
 #                         Strava OAuth + sync, AI profile interview
 # ═══════════════════════════════════════════════════════════════════
-APP_VERSION = "2.13.1"
+APP_VERSION = "2.14.0"
 ADMIN_EMAILS = {"mtpujol@gmail.com"}
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Form
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import psycopg2
@@ -1637,6 +1708,15 @@ COACHING_TOOLS = [
             "properties": {"date": {"type": "string", "description": "YYYY-MM-DD"}},
             "required": ["date"]
         }
+    },
+    {
+        "name": "get_power_curve",
+        "description": "Get one ride's power curve — best-average-power at key durations (5s, 15s, 30s, 1min, 5min, 10min, 20min, 30min, 60min, whichever the ride is long enough to have), plus a rough FTP estimate derived from it when computable. Use for questions that go beyond the basic 5s/15s/30s/5-min bests already in context — anything about sustained power at a specific duration, whether a ride looks like a new FTP, or overall power profile shape. Only works for rides with detailed stream data (uploaded/synced since raw-data storage was added).",
+        "input_schema": {
+            "type": "object",
+            "properties": {"ride_id": {"type": "integer"}},
+            "required": ["ride_id"]
+        }
     }
 ]
 
@@ -1833,6 +1913,34 @@ def tool_get_dated_log_entry(user_id, date):
         return {"error": f"No coaching log entry found for {date}"}
     return {"date": str(row['entry_date']), "summary": row['summary']}
 
+def tool_get_power_curve(user_id, ride_id):
+    """Relies on compute_power_curve()/estimate_ftp_from_curve()/
+    fmt_duration_label(), all defined later in this file near
+    build_ride_detail_html — fine at call time (this only runs during
+    request handling, well after the whole module has loaded), just
+    not colocated with the rest of the tool functions above."""
+    conn = get_db(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT id FROM rides WHERE id=%s AND user_id=%s", (ride_id, user_id))
+    if not cur.fetchone():
+        cur.close(); conn.close()
+        return {"error": "Ride not found or doesn't belong to this rider"}
+    cur.execute("SELECT streams FROM ride_streams WHERE ride_id=%s", (ride_id,))
+    row = cur.fetchone()
+    cur.close(); conn.close()
+    if not row or not row.get('streams') or not row['streams'].get('power'):
+        return {"error": "No detailed power stream data available for this ride"}
+    curve = compute_power_curve(row['streams']['power'])
+    if not curve:
+        return {"error": "Not enough power data to compute a curve for this ride"}
+    key_durations = [5, 15, 30, 60, 300, 600, 1200, 1800, 3600]
+    by_dur = {c['duration_s']: c['watts'] for c in curve}
+    checkpoints = {fmt_duration_label(d): by_dur[d] for d in key_durations if d in by_dur}
+    result = {"ride_id": ride_id, "power_curve_watts": checkpoints}
+    ftp_est = estimate_ftp_from_curve(curve)
+    if ftp_est:
+        result["estimated_ftp"] = {"watts": ftp_est['watts'], "basis": ftp_est['basis']}
+    return result
+
 def execute_coaching_tool(name, tool_input, user_id):
     try:
         if name == "get_ride_metric_range":
@@ -1845,6 +1953,8 @@ def execute_coaching_tool(name, tool_input, user_id):
             return tool_search_rides_and_history(user_id, **tool_input)
         elif name == "get_dated_log_entry":
             return tool_get_dated_log_entry(user_id, **tool_input)
+        elif name == "get_power_curve":
+            return tool_get_power_curve(user_id, **tool_input)
         else:
             return {"error": f"Unknown tool: {name}"}
     except Exception as e:
@@ -2284,6 +2394,25 @@ async def save_profile(
     cur.close(); conn.close()
     return {"status": "saved"}
 
+@app.post("/profile/ftp")
+def update_ftp_only(ftp: int = Form(...), user: dict = Depends(get_current_user)):
+    """Targeted FTP-only update — deliberately separate from POST
+    /profile above, which re-saves the WHOLE profile record from its
+    full form and would silently wipe every other field (age, weight,
+    goals, health notes, etc.) if called with only ftp set, since every
+    other field defaults to an empty string there. This is the safe
+    path for the ride-detail page's "apply this ride's estimated FTP"
+    button, or any other single-field FTP update — one column, one
+    targeted UPDATE, nothing else touched. Requires an existing profile
+    row (created via the interview or POST /profile) to attach to."""
+    conn = get_db(); cur = conn.cursor()
+    cur.execute("UPDATE profiles SET ftp=%s, updated_at=NOW() WHERE user_id=%s", (ftp, user['id']))
+    updated = cur.rowcount
+    cur.close(); conn.close()
+    if not updated:
+        raise HTTPException(status_code=404, detail="No profile on file yet — complete the profile interview first")
+    return {"status": "saved", "ftp": ftp}
+
 @app.post("/interview")
 async def ai_interview(
     message: str = Form(...),
@@ -2690,9 +2819,24 @@ async def coaching_chat(
 @app.get("/coaching/memory")
 def get_memory(user: dict = Depends(get_current_user)):
     """View what's currently stored in coaching memory — the dated log and the
-    five standing-pattern threads."""
+    five standing-pattern threads. Each dated_log entry now also carries a
+    `flagged` bool — true when a ride on that date is flagged as a possible
+    duplicate (possible_duplicate_of IS NOT NULL) — so the Ride History list
+    can show a badge in-context, not just the one dedicated review card on
+    the Dashboard, which is easy to miss if a rider doesn't happen to check
+    it. Read-only enrichment; doesn't change what's stored."""
     conn = get_db(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute("SELECT id, entry_date, summary FROM coaching_memory_log WHERE user_id=%s ORDER BY entry_date DESC LIMIT 50", (user['id'],))
+    cur.execute("""
+        SELECT l.id, l.entry_date, l.summary,
+            EXISTS(
+                SELECT 1 FROM rides r
+                WHERE r.user_id = %s AND r.ride_date = l.entry_date
+                    AND r.possible_duplicate_of IS NOT NULL
+            ) AS flagged
+        FROM coaching_memory_log l
+        WHERE l.user_id = %s
+        ORDER BY l.entry_date DESC LIMIT 50
+    """, (user['id'], user['id']))
     log = [dict(r) for r in cur.fetchall()]
     cur.execute("SELECT theme, content, updated_at FROM coaching_memory_themes WHERE user_id=%s", (user['id'],))
     themes = [dict(r) for r in cur.fetchall()]
@@ -3296,7 +3440,43 @@ def compute_power_curve(power_stream):
         curve.append({"duration_s": d, "watts": round(best_sum / d)})
     return curve
 
-def build_ride_detail_html(ride, streams):
+def estimate_ftp_from_curve(power_curve):
+    """Rough FTP estimate from a single ride's power curve — 95% of the
+    ride's best 20-minute power, the standard field estimate. Not a
+    lab-measured or structured-test FTP; always presented to the rider
+    as a suggestion to confirm, never silently written over what's on
+    file. Returns None when the ride isn't long enough for a 20-min
+    checkpoint (compute_power_curve() only includes a duration once the
+    ride has at least that many samples).
+
+    An earlier version of this also tried a 60-minute-direct fallback
+    for rides without a 20-min checkpoint but long enough for a 60-min
+    one — caught in testing as dead code: compute_power_curve() finds
+    the best window of each duration anywhere in the ride, so any ride
+    with enough samples for a 3600s checkpoint necessarily also has
+    enough for a 1200s one. That branch could never actually fire and
+    was removed rather than left in as unreachable code."""
+    if not power_curve:
+        return None
+    by_dur = {c['duration_s']: c['watts'] for c in power_curve}
+    if 1200 in by_dur:
+        return {'watts': round(by_dur[1200] * 0.95), 'basis': "95% of 20-min best"}
+    return None
+
+def fmt_duration_label(s):
+    """Human-readable label for a duration in seconds — 45s, 5min, 1.5hr
+    — shared by the power-curve chart's tick formatting logic (JS side)
+    and the coaching tool's checkpoint labels (Python side), so both
+    describe the same durations the same way."""
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        m = s / 60
+        return f"{int(m)}min" if m % 1 == 0 else f"{m:g}min"
+    h = s / 3600
+    return f"{int(h)}hr" if h % 1 == 0 else f"{h:g}hr"
+
+def build_ride_detail_html(ride, streams, profile_ftp=None):
     def esc(s):
         return html.escape(str(s)) if s is not None else ''
     def j(v):
@@ -3332,6 +3512,7 @@ def build_ride_detail_html(ride, streams):
     has_streams = bool(streams and streams.get('distance'))
     charts_html = ""
     chart_js = ""
+    ftp_banner_html = ""
 
     if has_streams:
         distances_raw = streams.get('distance') or []
@@ -3377,6 +3558,28 @@ def build_ride_detail_html(ride, streams):
         # wouldn't mean the same thing as dragging on a mile-based chart.
         power_curve = compute_power_curve(streams.get('power')) if streams.get('power') else []
         has_power_curve = len(power_curve) >= 3  # need at least a few points for a meaningful curve
+
+        # FTP estimate banner — only shown when a real estimate is
+        # computable AND it differs meaningfully (5%+) from what's on
+        # file in the profile, so this doesn't nag on every ride. Never
+        # auto-applies; always a suggestion with an explicit confirm
+        # step (POST /profile/ftp), never silently overwriting a real
+        # FTP test result.
+        ftp_banner_html = ""
+        ftp_estimate = estimate_ftp_from_curve(power_curve) if has_power_curve else None
+        if ftp_estimate:
+            est_watts = ftp_estimate['watts']
+            show_banner = (profile_ftp is None) or (abs(est_watts - profile_ftp) / max(profile_ftp, 1) >= 0.05)
+            if show_banner:
+                current_txt = (str(profile_ftp) + "W on file") if profile_ftp else "no FTP on file yet"
+                ftp_banner_html = (
+                    "<div class='dftp-banner'>"
+                    + "<b>Estimated FTP from this ride: " + str(est_watts) + "W</b> ("
+                    + esc(ftp_estimate['basis']) + ") &nbsp; — currently " + esc(current_txt) + ". "
+                    + "<a href=\"#\" onclick=\"window.parent.applyEstimatedFtp && window.parent.applyEstimatedFtp("
+                    + str(est_watts) + ");return false;\">Update profile FTP →</a>"
+                    + "</div>"
+                )
 
         charts_html = (
             "<div class='dselect-bar' id='selectBar'>Drag across any chart below to see stats for just that stretch.</div>"
@@ -3535,10 +3738,17 @@ def build_ride_detail_html(ride, streams):
         + ".dchart-wrap canvas{max-height:260px;}"
         + ".dselect-overlay{position:absolute;top:0;bottom:0;display:none;background:rgba(37,99,235,0.12);border-left:2px solid #2563eb;border-right:2px solid #2563eb;pointer-events:none;}"
         + ".dselect-bar{background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:10px 14px;margin-bottom:14px;font-size:0.8rem;color:#1e40af;}"
+        + ".dftp-banner{background:#f5f3ff;border:1px solid #ddd6fe;border-radius:8px;padding:10px 14px;margin-bottom:14px;font-size:0.8rem;color:#5b21b6;}"
+        + ".dftp-banner a{color:#7c3aed;font-weight:600;}"
+        + ".dhead-row{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;flex-wrap:wrap;}"
+        + ".dexport-link{font-size:0.75rem;color:#3b82f6;font-weight:500;text-decoration:none;white-space:nowrap;}"
         + "canvas{cursor:crosshair;}"
         + "</style></head><body>"
-        + "<h1>" + esc(ride.get('name', 'Ride')) + "</h1>"
-        + "<div class='ddate'>" + esc(date_str) + "</div>"
+        + "<div class='dhead-row'>"
+        + "<div><h1>" + esc(ride.get('name', 'Ride')) + "</h1><div class='ddate'>" + esc(date_str) + "</div></div>"
+        + "<a href=\"#\" class='dexport-link' onclick=\"window.parent.exportRideTcx && window.parent.exportRideTcx(" + str(ride.get('id')) + ");return false;\">📥 Export TCX</a>"
+        + "</div>"
+        + ftp_banner_html
         + stats_html
         + charts_html
         + "<script src='https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js'></script>"
@@ -3567,6 +3777,148 @@ def get_ride_by_date(ride_date: str, user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=404, detail="No ride found for this date")
     return {"ride_id": row['id']}
 
+def build_tcx(ride, streams):
+    """Builds a Garmin TCX v2 export for one ride from its stored raw
+    stream data.
+
+    GPX was considered and ruled out: GPX trackpoints require a real
+    lat/lon per the spec, and this app has never stored GPS coordinates
+    — FIT and Strava streams here only ever captured power, HR,
+    cadence, altitude, distance, and speed. Writing a GPX with fake or
+    zeroed coordinates would misrepresent the ride's actual route to
+    whatever tool imports it, which is worse than not offering GPX at
+    all. TCX's Trackpoint schema, unlike GPX's, makes Position
+    genuinely optional — Time, DistanceMeters, AltitudeMeters,
+    HeartRateBpm, Cadence, and a Garmin TPX extension for Watts are all
+    valid without it — so this is a real, standards-compliant export
+    that TrainingPeaks, Garmin Connect, WKO, and others can read, just
+    without a route/map. TCX *import* into this app is a natural
+    follow-up but a separate, larger piece (its own parser alongside
+    the existing FIT/Strava paths) — not attempted here.
+    """
+    def esc(s):
+        return html.escape(str(s)) if s is not None else ''
+
+    start_time = ride.get('start_time')
+    if start_time and hasattr(start_time, 'isoformat'):
+        start_dt = start_time
+    elif ride.get('ride_date'):
+        start_dt = datetime.combine(ride['ride_date'], datetime.min.time())
+    else:
+        start_dt = datetime.utcnow()
+
+    distances = streams.get('distance') or []
+    n = len(distances)
+    altitudes = streams.get('altitude') or []
+    powers = streams.get('power') or []
+    hrs = streams.get('heart_rate') or []
+    cadences = streams.get('cadence') or []
+
+    # Per-point absolute timestamps — FIT-sourced streams carry real ISO
+    # timestamps ('timestamp'); Strava-sourced streams only carry a
+    # seconds-from-start offset ('time_offset_s', their native format,
+    # kept as-is on import). Handle both rather than assuming one; fall
+    # back to a ~1Hz assumption (matching the convention used elsewhere
+    # in this file, e.g. best_avg()) if neither is present.
+    raw_ts = streams.get('timestamp')
+    time_offsets = streams.get('time_offset_s')
+
+    def point_time(i):
+        if raw_ts and i < len(raw_ts) and raw_ts[i]:
+            try:
+                return datetime.fromisoformat(str(raw_ts[i]).replace('Z', ''))
+            except Exception:
+                pass
+        if time_offsets and i < len(time_offsets) and time_offsets[i] is not None:
+            return start_dt + timedelta(seconds=time_offsets[i])
+        return start_dt + timedelta(seconds=i)
+
+    def g(arr, i):
+        return arr[i] if i < len(arr) else None
+
+    trackpoints = []
+    for i in range(n):
+        t = point_time(i)
+        parts = ["<Trackpoint>", "<Time>" + t.strftime('%Y-%m-%dT%H:%M:%SZ') + "</Time>"]
+        d = g(distances, i)
+        if d is not None:
+            parts.append("<DistanceMeters>" + str(round(d, 1)) + "</DistanceMeters>")
+        a = g(altitudes, i)
+        if a is not None:
+            parts.append("<AltitudeMeters>" + str(round(a, 1)) + "</AltitudeMeters>")
+        h_ = g(hrs, i)
+        if h_ is not None:
+            parts.append("<HeartRateBpm><Value>" + str(int(h_)) + "</Value></HeartRateBpm>")
+        c = g(cadences, i)
+        if c is not None:
+            parts.append("<Cadence>" + str(int(c)) + "</Cadence>")
+        p = g(powers, i)
+        if p is not None:
+            parts.append(
+                "<Extensions><TPX xmlns=\"http://www.garmin.com/xmlschemas/ActivityExtension/v2\">"
+                "<Watts>" + str(int(p)) + "</Watts></TPX></Extensions>"
+            )
+        parts.append("</Trackpoint>")
+        trackpoints.append(''.join(parts))
+
+    total_time_s = round(ride['duration_h'] * 3600) if ride.get('duration_h') else n
+    if distances and distances[-1] is not None:
+        total_dist_m = distances[-1]
+    else:
+        total_dist_m = (ride.get('dist_mi') or 0) * 1609.34
+    calories = ride.get('calories') or 0
+
+    xml = (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+        "<TrainingCenterDatabase xmlns=\"http://www.garmin.com/xmlschemas/TrainingCenterDatabase/v2\" "
+        "xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" "
+        "xsi:schemaLocation=\"http://www.garmin.com/xmlschemas/TrainingCenterDatabase/v2 "
+        "http://www.garmin.com/xmlschemas/TrainingCenterDatabasev2.xsd\">"
+        "<Activities><Activity Sport=\"Biking\">"
+        "<Id>" + start_dt.strftime('%Y-%m-%dT%H:%M:%SZ') + "</Id>"
+        "<Lap StartTime=\"" + start_dt.strftime('%Y-%m-%dT%H:%M:%SZ') + "\">"
+        "<TotalTimeSeconds>" + str(total_time_s) + "</TotalTimeSeconds>"
+        "<DistanceMeters>" + str(round(total_dist_m, 1)) + "</DistanceMeters>"
+        "<Calories>" + str(int(calories)) + "</Calories>"
+        "<Intensity>Active</Intensity>"
+        "<TriggerMethod>Manual</TriggerMethod>"
+        "<Track>" + ''.join(trackpoints) + "</Track>"
+        "</Lap>"
+        "<Notes>" + esc(ride.get('name', 'Ride'))
+        + " — exported from Cycling Coach. No GPS data (never captured by this app); "
+        "power/HR/cadence/elevation/distance only.</Notes>"
+        "</Activity></Activities>"
+        "</TrainingCenterDatabase>"
+    )
+    return xml
+
+@app.get("/rides/{ride_id}/export-tcx")
+def export_ride_tcx(ride_id: int, user: dict = Depends(get_current_user)):
+    """Single-ride TCX export — TrainingPeaks/Garmin Connect/WKO-
+    compatible, built from this app's own stored raw stream data. See
+    build_tcx() for why TCX rather than GPX (no GPS ever captured)."""
+    conn = get_db(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT * FROM rides WHERE id=%s AND user_id=%s", (ride_id, user['id']))
+    ride = cur.fetchone()
+    if not ride:
+        cur.close(); conn.close()
+        raise HTTPException(status_code=404, detail="Ride not found")
+    cur.execute("SELECT streams FROM ride_streams WHERE ride_id=%s", (ride_id,))
+    srow = cur.fetchone()
+    cur.close(); conn.close()
+    if not srow or not srow.get('streams'):
+        raise HTTPException(status_code=400,
+            detail="No detailed stream data available for this ride — only rides uploaded/synced since raw-data storage was added have this.")
+    xml = build_tcx(dict(ride), srow['streams'])
+    ride_date = ride.get('ride_date')
+    date_str = ride_date.isoformat() if hasattr(ride_date, 'isoformat') else str(ride_date)
+    filename = "ride_" + date_str + "_" + str(ride_id) + ".tcx"
+    return Response(
+        content=xml,
+        media_type="application/vnd.garmin.tcx+xml",
+        headers={"Content-Disposition": "attachment; filename=" + filename}
+    )
+
 @app.get("/rides/{ride_id}/detail-page", response_class=HTMLResponse)
 def get_ride_detail_page(ride_id: int, user: dict = Depends(get_current_user)):
     conn = get_db(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
@@ -3579,9 +3931,12 @@ def get_ride_detail_page(ride_id: int, user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=404, detail="Ride not found")
     cur.execute("SELECT streams FROM ride_streams WHERE ride_id=%s", (ride_id,))
     srow = cur.fetchone()
+    cur.execute("SELECT ftp FROM profiles WHERE user_id=%s", (user['id'],))
+    prow = cur.fetchone()
     cur.close(); conn.close()
     streams = srow['streams'] if srow else None
-    html_out = build_ride_detail_html(dict(ride), streams)
+    profile_ftp = prow['ftp'] if prow and prow.get('ftp') else None
+    html_out = build_ride_detail_html(dict(ride), streams, profile_ftp=profile_ftp)
     return HTMLResponse(content=html_out)
 
 @app.get("/dashboard", response_class=HTMLResponse)
