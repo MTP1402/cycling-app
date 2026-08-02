@@ -1,11 +1,63 @@
 # ═══════════════════════════════════════════════════════════════════
 # CYCLING COACH API — main.py
 #
-# VERSION: 2.9.2  (2026-08-02)
+# VERSION: 2.11.0  (2026-08-02)
 # Check this against GET / on the live Railway URL before assuming
 # a deploy has actually landed — the two should always match.
 #
 # CHANGELOG
+#   2.11.0 (2026-08-02) — closed the same gap on the OTHER import
+#                         path: manual FIT uploads never checked
+#                         activity type either, only Strava sync did
+#                         (fixed in 2.10.0). FIT files carry a sport
+#                         field — already extracted for virtual-ride
+#                         detection, just never checked against non-
+#                         cycling activities. /upload now rejects
+#                         running/walking/hiking/swimming with a clear
+#                         error; a missing/blank sport is still
+#                         allowed, since some devices don't always
+#                         populate it and there's no reason to assume
+#                         the worst on an ambiguous case.
+#                         Also added GET /rides/audit-slow-pace — a
+#                         genuine way to find walks already sitting in
+#                         the database from before this fix existed.
+#                         The app never stored activity type on
+#                         existing rows, so there's no direct lookup;
+#                         this uses average pace instead (<6 mph) as a
+#                         real, if imperfect, heuristic — walking pace
+#                         is categorically different from even a slow
+#                         ride. Verified directly against Marc's own
+#                         real walk data (6 activities, 6.4mi, 2h13m —
+#                         2.89 mph average) before shipping, and
+#                         confirmed a genuinely hilly, slow ride (8mph)
+#                         correctly stays unflagged. Surfaces
+#                         candidates for review only — deletes nothing
+#                         on its own.
+#   2.10.0 (2026-08-02) — Strava sync has never filtered by activity
+#                         type — it pulled and stored everything
+#                         Strava returned (walks, runs, hikes, etc.)
+#                         as if they were rides. Not related to the
+#                         dedup bug fixed earlier the same day — a
+#                         separate, longer-standing gap, found while
+#                         accounting for a small remaining mileage
+#                         difference (app showing 3,006.1mi/107 rides
+#                         against Strava's own 2,999.6mi/100 activities
+#                         after cleaning up the dedup bug's damage —
+#                         Marc's own hypothesis that the extra ~7
+#                         entries might be walks, not rides). Added
+#                         CYCLING_ACTIVITY_TYPES, checking Strava's
+#                         sport_type field first (more specific —
+#                         GravelRide, MountainBikeRide, etc.), falling
+#                         back to the older type field if not present.
+#                         Prevents this going forward; does NOT
+#                         retroactively identify anything already
+#                         imported, since activity type was never
+#                         stored on existing rows — no way to tell,
+#                         after the fact, which past rides might have
+#                         been misclassified. Manual inspection (short
+#                         distance, odd pace, a telling name) is the
+#                         only way to find any that already slipped
+#                         through.
 #   2.9.2 (2026-08-02) — added GET /rides/audit-duplicates, a one-time
 #                         read-only diagnostic to find rides matching
 #                         the exact pattern the v2.8.0 bug (fixed in
@@ -592,7 +644,7 @@
 #   1.0.0                initial live build — dashboard, FIT upload,
 #                         Strava OAuth + sync, AI profile interview
 # ═══════════════════════════════════════════════════════════════════
-APP_VERSION = "2.9.2"
+APP_VERSION = "2.11.0"
 ADMIN_EMAILS = {"mtpujol@gmail.com"}
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Form
@@ -628,6 +680,13 @@ security      = HTTPBearer()
 ANNUAL_GOAL    = 6500
 WEEKLY_TARGET  = 125
 YEAR           = 2026
+
+# Strava activity types that count as cycling — everything else (Walk,
+# Run, Hike, Swim, etc.) gets skipped during sync. Covers both sport_type
+# (Strava's newer, more specific field) and the older, simpler type field.
+CYCLING_ACTIVITY_TYPES = {
+    "Ride", "VirtualRide", "EBikeRide", "GravelRide", "MountainBikeRide", "Handcycle"
+}
 
 # Coaching memory themes — standing patterns tracked across sessions, separate
 # from the dated log (which is per-ride/per-episode). Keys are the DB values;
@@ -907,6 +966,7 @@ def parse_fit_bytes(data):
         return {
             'ride_date':   start.strftime('%Y-%m-%d') if hasattr(start,'strftime') else str(start)[:10],
             'start_time':  start.isoformat() if hasattr(start,'isoformat') else None,
+            'sport':       sport,
             'name':        session.get('sport', 'Ride'),
             'dist_mi':     dist_mi,
             'duration_h':  duration_h,
@@ -1878,6 +1938,15 @@ async def upload_fit(file: UploadFile = File(...), notes: str = Form(default="")
                      user: dict = Depends(get_current_user)):
     data    = await file.read()
     metrics = parse_fit_bytes(data)
+    # Same gap the Strava sync path had — FIT files carry a sport field
+    # (already extracted for virtual-ride detection, just never checked
+    # against non-cycling activities). Reject known non-cycling sports;
+    # allow a missing/blank sport rather than reject, since some devices
+    # don't always populate it and there's no reason to assume the worst.
+    NON_CYCLING_FIT_SPORTS = {"running", "walking", "hiking", "swimming"}
+    if metrics.get('sport') in NON_CYCLING_FIT_SPORTS:
+        raise HTTPException(status_code=400,
+            detail=f"This file is a {metrics['sport']} activity, not a ride — only cycling activities are tracked here.")
     streams = metrics.pop('streams', None)  # keep out of the API response — big, browser doesn't need it
     conn = get_db(); cur = conn.cursor()
     # Deduplication — checks whether this ride's actual time WINDOW
@@ -2842,7 +2911,7 @@ async def strava_sync(
     days_back_ts  = int(time.time()) - (days_back * 86400)
     year_start_ts = int(datetime(YEAR, 1, 1).timestamp())
     after_ts = max(days_back_ts, year_start_ts)
-    imported = 0; skipped = 0; errors = 0; out_of_range = 0; flagged = 0
+    imported = 0; skipped = 0; errors = 0; out_of_range = 0; flagged = 0; non_cycling = 0
     page = 1
 
     async with httpx.AsyncClient() as client:
@@ -2858,6 +2927,21 @@ async def strava_sync(
 
             for act in activities:
                 try:
+                    # The sync has never filtered by activity type — it
+                    # pulled and stored everything Strava returned,
+                    # walks and runs included, as if they were rides.
+                    # Not related to tonight's dedup bug — a separate,
+                    # longer-standing gap, found while accounting for a
+                    # small remaining mileage difference against
+                    # Strava's own totals. sport_type is Strava's more
+                    # specific field (GravelRide, MountainBikeRide,
+                    # etc.); type is the older, simpler one — check
+                    # sport_type first, fall back to type if it's not
+                    # present, so older API responses are still handled.
+                    activity_type = act.get('sport_type') or act.get('type') or ''
+                    if activity_type not in CYCLING_ACTIVITY_TYPES:
+                        non_cycling += 1
+                        continue
                     start_local_raw = act.get('start_date_local','')
                     act_date = start_local_raw[:10]
                     # Strava's start_date_local is ISO-formatted with a "Z"
@@ -3019,9 +3103,10 @@ async def strava_sync(
     cur.execute("UPDATE strava_tokens SET last_sync=NOW() WHERE user_id=%s", (user['id'],))
     cur.close(); conn.close()
 
-    return {"imported": imported, "skipped": skipped, "errors": errors, "out_of_range": out_of_range, "flagged": flagged,
+    return {"imported": imported, "skipped": skipped, "errors": errors, "out_of_range": out_of_range, "flagged": flagged, "non_cycling": non_cycling,
             "message": f"Synced {imported} new activities from Strava ({skipped} already existed, "
-                       f"{out_of_range} outside {YEAR}" + (f", {flagged} possible duplicate{'s' if flagged != 1 else ''} to review" if flagged else "") + ")"}
+                       f"{out_of_range} outside {YEAR}" + (f", {flagged} possible duplicate{'s' if flagged != 1 else ''} to review" if flagged else "")
+                       + (f", {non_cycling} non-cycling activit{'ies' if non_cycling != 1 else 'y'} skipped" if non_cycling else "") + ")"}
 
 @app.delete("/rides/clear")
 def clear_rides(user: dict = Depends(get_current_user)):
@@ -3041,6 +3126,31 @@ def delete_ride(ride_id: int, user: dict = Depends(get_current_user)):
     if not deleted:
         raise HTTPException(status_code=404, detail="Ride not found")
     return {"status": "deleted", "id": ride_id}
+
+@app.get("/rides/audit-slow-pace")
+def audit_slow_pace(user: dict = Depends(get_current_user)):
+    """Flags rides with a suspiciously slow average pace — a real
+    heuristic for finding walks that got imported as rides before the
+    activity-type filter existed (v2.10.0), since the app never stored
+    what kind of activity each ride actually was, so there's no direct
+    way to look this up. Walking pace (2-4 mph) is categorically
+    different from even a slow, casual ride (6+ mph), so a <6 mph
+    threshold should catch genuine walks — but this is a heuristic,
+    not a certainty: a very hilly or stop-heavy ride could occasionally
+    land here too. Surfaces candidates for manual review; deletes
+    nothing on its own."""
+    conn = get_db(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("""
+        SELECT id, ride_date, name, dist_mi, duration_h,
+               ROUND((dist_mi / NULLIF(duration_h, 0))::numeric, 1) AS avg_mph
+        FROM rides
+        WHERE user_id=%s AND dist_mi IS NOT NULL AND duration_h IS NOT NULL AND duration_h > 0
+            AND (dist_mi / duration_h) < 6
+        ORDER BY ride_date DESC
+    """, (user['id'],))
+    candidates = [dict(r) for r in cur.fetchall()]
+    cur.close(); conn.close()
+    return {"candidates": candidates, "count": len(candidates)}
 
 @app.get("/rides/audit-duplicates")
 def audit_duplicates(user: dict = Depends(get_current_user)):
