@@ -1,11 +1,49 @@
 # ═══════════════════════════════════════════════════════════════════
 # CYCLING COACH API — main.py
 #
-# VERSION: 2.17.0  (2026-08-03)
+# VERSION: 2.18.0  (2026-08-03)
 # Check this against GET / on the live Railway URL before assuming
 # a deploy has actually landed — the two should always match.
 #
 # CHANGELOG
+#   2.18.0 (2026-08-03) — fixed a real silent-failure gap in Strava sync,
+#                         found while diagnosing a beta tester (Mitch)
+#                         reporting "connected but won't sync": the code
+#                         treated ANY non-list response from Strava's
+#                         /athlete/activities endpoint the same way —
+#                         a genuine empty result set (no new rides in
+#                         the selected window) produced the exact same
+#                         "Synced 0 new activities (0 already existed,
+#                         0 outside 2026)" message as an actual API
+#                         failure (expired/revoked token, rate limit,
+#                         etc.), since both just hit the same silent
+#                         break with all counters at zero. A rider with
+#                         a genuinely broken connection and a rider who
+#                         simply had no new rides saw identical text,
+#                         with no way to tell which one actually
+#                         happened — exactly the ambiguity that made
+#                         Mitch's report hard to diagnose from the
+#                         message alone.
+#                         Now checks the actual HTTP status code:
+#                         non-200 responses are captured as a distinct
+#                         api_error (including Strava's own error
+#                         message) and returned with a new strava_error
+#                         flag and a message that says plainly that
+#                         Strava returned an error, rather than
+#                         implying nothing needed to sync. last_sync is
+#                         no longer stamped on a failed attempt either
+#                         — it should only reflect a sync that actually
+#                         reached Strava successfully, not a broken one
+#                         that happened to run.
+#                         Tested before shipping: the branching logic
+#                         run directly against four realistic response
+#                         shapes (genuine empty 200, a 401 auth
+#                         failure with Strava's real error shape, a 429
+#                         rate-limit response, and normal successful
+#                         data) — confirmed only the two failure cases
+#                         set api_error, and the genuine-empty and
+#                         real-data cases are left alone exactly as
+#                         before.
 #   2.17.0 (2026-08-03) — extended POST /coaching/import to accept .pdf
 #                         and .docx alongside the existing .txt/.md,
 #                         per explicit request. New extract_pdf_text()
@@ -930,7 +968,7 @@
 #   1.0.0                initial live build — dashboard, FIT upload,
 #                         Strava OAuth + sync, AI profile interview
 # ═══════════════════════════════════════════════════════════════════
-APP_VERSION = "2.17.0"
+APP_VERSION = "2.18.0"
 ADMIN_EMAILS = {"mtpujol@gmail.com"}
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Form
@@ -3340,6 +3378,15 @@ async def strava_sync(
     year_start_ts = int(datetime(YEAR, 1, 1).timestamp())
     after_ts = max(days_back_ts, year_start_ts)
     imported = 0; skipped = 0; errors = 0; out_of_range = 0; flagged = 0; non_cycling = 0
+    # v2.18.0 fix: previously, ANY non-list response from Strava (a genuine empty
+    # result set, but ALSO an auth failure, a revoked token, a rate-limit response,
+    # etc.) hit the same silent `break` below and produced an identical "Synced 0
+    # new activities (0 already existed, 0 outside 2026)" message — a rider with a
+    # broken connection and a rider who genuinely has no new rides saw the exact
+    # same text, with no way to tell which one actually happened. api_error now
+    # captures a real failure distinctly, checked via the HTTP status code rather
+    # than just "is this a list."
+    api_error = None
     page = 1
 
     async with httpx.AsyncClient() as client:
@@ -3350,6 +3397,10 @@ async def strava_sync(
                 params={"after": after_ts, "per_page": 50, "page": page}
             )
             activities = resp.json()
+            if resp.status_code != 200:
+                err_detail = activities.get('message') if isinstance(activities, dict) else str(activities)
+                api_error = f"Strava returned an error (HTTP {resp.status_code}): {err_detail}"
+                break
             if not activities or not isinstance(activities, list):
                 break
 
@@ -3477,8 +3528,18 @@ async def strava_sync(
                 break
             page += 1
 
-    cur.execute("UPDATE strava_tokens SET last_sync=NOW() WHERE user_id=%s", (user['id'],))
+    # last_sync reflects that a sync was attempted and reached Strava, whether or
+    # not it turned up new rides — but NOT stamped when the request itself failed
+    # (api_error), since "last sync" implying success on a genuinely broken
+    # connection would be actively misleading.
+    if not api_error:
+        cur.execute("UPDATE strava_tokens SET last_sync=NOW() WHERE user_id=%s", (user['id'],))
     cur.close(); conn.close()
+
+    if api_error:
+        return {"imported": 0, "skipped": 0, "errors": 0, "out_of_range": 0, "flagged": 0, "non_cycling": 0,
+                "strava_error": True,
+                "message": api_error + " — try reconnecting Strava from the Activities tab."}
 
     return {"imported": imported, "skipped": skipped, "errors": errors, "out_of_range": out_of_range, "flagged": flagged, "non_cycling": non_cycling,
             "message": f"Synced {imported} new activities from Strava ({skipped} already existed, "
