@@ -1,11 +1,61 @@
 # ═══════════════════════════════════════════════════════════════════
 # CYCLING COACH API — main.py
 #
-# VERSION: 2.18.0  (2026-08-03)
+# VERSION: 2.20.0  (2026-08-05)
 # Check this against GET / on the live Railway URL before assuming
 # a deploy has actually landed — the two should always match.
 #
 # CHANGELOG
+#   2.20.0 (2026-08-05) — real bug, found from Marc's own account: the
+#                         "Possible Duplicate Rides" flag (possible_
+#                         duplicate_of) was designed for a genuine
+#                         different-source duplicate — a Karoo FIT
+#                         upload and a Strava sync of the same physical
+#                         ride overlapping in time, correctly inserted
+#                         as two rows and flagged for the rider to
+#                         pick a canonical one. But strava_sync() had
+#                         no check against Strava's own activity ID —
+#                         every Sync Now click re-pulled the whole
+#                         date window and re-ran the same time-overlap
+#                         check, which found the ride it had already
+#                         imported on the LAST sync, and hit the exact
+#                         same insert-and-flag path again. Result: every
+#                         repeat sync added one more flagged "duplicate"
+#                         of the same ride, forever — reported as
+#                         "keeps adding the old stuff over again."
+#                         Fixed with a new strava_activity_id column
+#                         and an ID-based check that runs before the
+#                         overlap check: if this exact Strava activity
+#                         was already imported, skip it outright, no
+#                         flag. The overlap-check still runs normally
+#                         for anything without a prior ID match, so
+#                         real cross-source duplicates (FIT vs Strava)
+#                         are still caught correctly. Also moved the
+#                         "Possible Duplicate Rides" card from Dashboard
+#                         to Activities, right under Sync from Strava,
+#                         at Marc's request — it's a sync-adjacent
+#                         concern, not a dashboard metric.
+#   2.19.0 (2026-08-03) — added POST /strava/disconnect, a real gap
+#                         found while diagnosing Mitch's sync issue:
+#                         there was previously no way for a rider — or
+#                         anyone — to force a fresh Strava OAuth
+#                         handshake once already connected. The
+#                         frontend never showed the Connect Strava
+#                         button again after the first successful
+#                         connection, and there was no backend
+#                         endpoint to clear a stored (possibly stale
+#                         or revoked) token even if there had been.
+#                         This matters specifically because a bad
+#                         access/refresh token pair is one of the most
+#                         likely real causes behind the "connected but
+#                         sync silently returns nothing" symptom that
+#                         v2.18.0's api_error fix was built to surface
+#                         — surfacing the problem doesn't help much if
+#                         there's still no way to actually fix it from
+#                         inside the app. Deletes only the
+#                         strava_tokens row for that rider; already-
+#                         imported ride history is completely
+#                         untouched.
 #   2.18.0 (2026-08-03) — fixed a real silent-failure gap in Strava sync,
 #                         found while diagnosing a beta tester (Mitch)
 #                         reporting "connected but won't sync": the code
@@ -968,7 +1018,7 @@
 #   1.0.0                initial live build — dashboard, FIT upload,
 #                         Strava OAuth + sync, AI profile interview
 # ═══════════════════════════════════════════════════════════════════
-APP_VERSION = "2.18.0"
+APP_VERSION = "2.20.0"
 ADMIN_EMAILS = {"mtpujol@gmail.com"}
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Form
@@ -1121,6 +1171,7 @@ def init_db():
         ALTER TABLE rides ADD COLUMN IF NOT EXISTS equipment_id INTEGER REFERENCES equipment(id);
         ALTER TABLE rides ADD COLUMN IF NOT EXISTS start_time TIMESTAMP;
         ALTER TABLE rides ADD COLUMN IF NOT EXISTS possible_duplicate_of INTEGER REFERENCES rides(id);
+        ALTER TABLE rides ADD COLUMN IF NOT EXISTS strava_activity_id BIGINT;
         ALTER TABLE profiles ADD COLUMN IF NOT EXISTS timezone TEXT;
     """)
     cur.close(); conn.close()
@@ -3343,6 +3394,23 @@ def strava_status(user: dict = Depends(get_current_user)):
     token = cur.fetchone(); cur.close(); conn.close()
     return {"connected": token is not None, "last_sync": str(token['last_sync']) if token and token['last_sync'] else None}
 
+@app.post("/strava/disconnect")
+def strava_disconnect(user: dict = Depends(get_current_user)):
+    """Removes this rider's stored Strava connection so Connect Strava can
+    run a genuinely fresh OAuth handshake afterward. Found to be a real,
+    missing gap while diagnosing a beta tester's "connected but won't
+    sync" report: there was previously no way for a rider — or anyone —
+    to force a new access/refresh token pair once the stored one had
+    gone bad (expired, revoked from Strava's own account settings,
+    etc.), short of a developer manually clearing the database row.
+    Ride history already imported is completely untouched — this only
+    removes the connection record itself, not any rides."""
+    conn = get_db(); cur = conn.cursor()
+    cur.execute("DELETE FROM strava_tokens WHERE user_id=%s", (user['id'],))
+    deleted = cur.rowcount
+    cur.close(); conn.close()
+    return {"status": "disconnected", "had_connection": bool(deleted)}
+
 @app.post("/strava/sync")
 async def strava_sync(
     days_back: int = Form(default=90),
@@ -3423,6 +3491,25 @@ async def strava_sync(
                     is_virt  = act.get('trainer', False) or 'virtual' in sport or 'zwift' in (act.get('name','') or '').lower()
 
                     cur3 = conn.cursor()
+
+                    # v2.20.0 fix: the overlap-check below (duplicate_of_id) is meant to
+                    # catch a *different-source* duplicate — e.g. a Karoo FIT upload and
+                    # a later Strava sync of the same physical ride — and correctly
+                    # inserts-and-flags that case so the rider can pick a canonical copy.
+                    # But with no check against Strava's own activity ID, a *re-sync* of
+                    # the exact same Strava activity you already imported also overlaps
+                    # its own earlier copy, and was hitting that same insert-and-flag path
+                    # every time — so clicking Sync Now repeatedly kept adding a fresh
+                    # flagged "duplicate" of the same ride forever. This check runs first:
+                    # if we've already stored this exact Strava activity ID for this user,
+                    # it's a genuine re-sync, not a duplicate worth flagging — skip clean.
+                    strava_id = act.get('id')
+                    if strava_id is not None:
+                        cur3.execute("SELECT id FROM rides WHERE user_id=%s AND strava_activity_id=%s",
+                                    (user['id'], strava_id))
+                        if cur3.fetchone():
+                            cur3.close(); skipped += 1; continue
+
                     new_end_time = None
                     if start_time_val and elapsed_h:
                         try:
@@ -3494,15 +3581,15 @@ async def strava_sync(
 
                     cur3.execute("""INSERT INTO rides (user_id,ride_date,start_time,name,dist_mi,duration_h,
                         avg_power,norm_power,avg_hr,max_hr,avg_cadence,max_cadence,
-                        p5,p15,p30,p300,elev_gain_ft,elev_loss_ft,calories,elapsed_h,ride_type,is_virtual,temp_c,notes,possible_duplicate_of)
-                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                        p5,p15,p30,p300,elev_gain_ft,elev_loss_ft,calories,elapsed_h,ride_type,is_virtual,temp_c,notes,possible_duplicate_of,strava_activity_id)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
                         (user['id'], act_date, start_time_val, act.get('name','Activity'),
                          dist_mi, dur_h, avg_power, np_val,
                          avg_hr, act.get('max_heartrate'),
                          avg_cad, max(cads) if cads else None,
                          best_avg(powers,5), best_avg(powers,15), best_avg(powers,30), best_avg(powers,300),
                          elev_ft, elev_loss_ft, act.get('calories'), elapsed_h, ride_type, is_virt,
-                         act.get('average_temp'), None, duplicate_of_id))
+                         act.get('average_temp'), None, duplicate_of_id, strava_id))
                     new_ride_id = cur3.fetchone()[0]
 
                     stream_data = {
