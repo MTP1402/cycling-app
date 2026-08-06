@@ -1,11 +1,32 @@
 # ═══════════════════════════════════════════════════════════════════
 # CYCLING COACH API — main.py
 #
-# VERSION: 2.20.0  (2026-08-05)
+# VERSION: 2.20.1  (2026-08-05)
 # Check this against GET / on the live Railway URL before assuming
 # a deploy has actually landed — the two should always match.
 #
 # CHANGELOG
+#   2.20.1 (2026-08-05) — v2.20.0's ID check only caught re-syncs of
+#                         rows that ALREADY had a strava_activity_id
+#                         stored — every row synced before that fix
+#                         has NULL there, so re-syncing them still hit
+#                         the old insert-and-flag path every time.
+#                         Confirmed live: 7 flagged pairs became 11 on
+#                         the very next Sync Now after v2.20.0 was
+#                         deployed. Fixed: when an overlap match is
+#                         found and the existing row has no Strava ID
+#                         on file, backfill it with the current sync's
+#                         ID and skip cleanly instead of flagging — so
+#                         every ride only needs to survive ONE more
+#                         sync under the old gap before it's fully
+#                         ID-tracked and immune going forward. Also
+#                         added POST /rides/cleanup-exact-duplicates,
+#                         a one-time bulk cleanup for the mess this
+#                         bug already created: deletes flagged rows
+#                         that are stat-for-stat identical to their
+#                         original (pure re-sync noise), keeps
+#                         genuinely different-looking pairs (real FIT-
+#                         vs-Strava merge decisions) for manual review.
 #   2.20.0 (2026-08-05) — real bug, found from Marc's own account: the
 #                         "Possible Duplicate Rides" flag (possible_
 #                         duplicate_of) was designed for a genuine
@@ -1018,7 +1039,7 @@
 #   1.0.0                initial live build — dashboard, FIT upload,
 #                         Strava OAuth + sync, AI profile interview
 # ═══════════════════════════════════════════════════════════════════
-APP_VERSION = "2.20.0"
+APP_VERSION = "2.20.1"
 ADMIN_EMAILS = {"mtpujol@gmail.com"}
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Form
@@ -3528,7 +3549,26 @@ async def strava_sync(
                             (user['id'], act_date, new_end_time, start_time_val))
                         overlap_match = cur3.fetchone()
                         if overlap_match:
-                            duplicate_of_id = overlap_match[0]
+                            existing_id = overlap_match[0]
+                            # v2.20.1 fix: the ID check above only catches re-syncs of
+                            # rows that ALREADY have a strava_activity_id stored — but
+                            # every row synced before v2.20.0 has NULL there, so this
+                            # overlap match kept hitting the insert-and-flag path below
+                            # on every single re-sync, same as before the ID check
+                            # existed. Reported by Marc: 7 flagged pairs became 11 on
+                            # the very next Sync Now, after the v2.20.0 fix was already
+                            # live. If we have a real Strava ID for this activity right
+                            # now and the matched existing row doesn't have one on file,
+                            # this overlap is almost certainly that same legacy row —
+                            # backfill it and skip cleanly rather than flag again.
+                            if strava_id is not None:
+                                cur3.execute("SELECT strava_activity_id FROM rides WHERE id=%s", (existing_id,))
+                                existing_strava_id = cur3.fetchone()[0]
+                                if existing_strava_id is None:
+                                    cur3.execute("UPDATE rides SET strava_activity_id=%s WHERE id=%s",
+                                                (strava_id, existing_id))
+                                    cur3.close(); skipped += 1; continue
+                            duplicate_of_id = existing_id
 
                     if duplicate_of_id is None:
                         cur3.execute("""SELECT id FROM rides WHERE user_id=%s
@@ -3711,6 +3751,45 @@ def audit_duplicates(user: dict = Depends(get_current_user)):
     pairs = [dict(r) for r in cur.fetchall()]
     cur.close(); conn.close()
     return {"pairs": pairs, "count": len(pairs)}
+
+@app.post("/rides/cleanup-exact-duplicates")
+def cleanup_exact_duplicates(user: dict = Depends(get_current_user)):
+    """One-time cleanup for the runaway-duplicate bug (v2.20.0/v2.20.1):
+    repeat Sync Now clicks against rows that predated strava_activity_id
+    tracking kept inserting fresh flagged copies of the same ride. Most
+    of those flagged pairs are EXACT stat-for-stat matches of their
+    original — not a genuine two-source merge decision, just noise from
+    the bug. This deletes only those exact matches (flagged row's
+    dist/duration/power/hr all equal the original's, within a tight
+    tolerance), keeping the original. Pairs that actually differ — like
+    a real FIT-upload vs Strava-sync of the same physical ride, where
+    distance or title genuinely differs — are left untouched for manual
+    review, since that's a real "which source do I trust" decision, not
+    cleanup noise."""
+    conn = get_db(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("""
+        SELECT f.id AS flagged_id, f.name AS flagged_name, f.dist_mi AS flagged_dist,
+               f.duration_h AS flagged_duration, f.avg_power AS flagged_avg_power, f.avg_hr AS flagged_avg_hr,
+               o.id AS original_id, o.name AS original_name
+        FROM rides f
+        JOIN rides o ON f.possible_duplicate_of = o.id
+        WHERE f.user_id=%s
+            AND ABS(COALESCE(f.dist_mi,0) - COALESCE(o.dist_mi,0)) < 0.05
+            AND ABS(COALESCE(f.duration_h,0) - COALESCE(o.duration_h,0)) < 0.02
+            AND COALESCE(f.avg_power,-1) = COALESCE(o.avg_power,-1)
+            AND COALESCE(f.avg_hr,-1) = COALESCE(o.avg_hr,-1)
+    """, (user['id'],))
+    exact_dupes = cur.fetchall()
+    deleted = []
+    cur2 = conn.cursor()
+    for row in exact_dupes:
+        cur2.execute("DELETE FROM rides WHERE id=%s AND user_id=%s", (row['flagged_id'], user['id']))
+        deleted.append({"deleted_id": row['flagged_id'], "deleted_name": row['flagged_name'], "kept_id": row['original_id'], "kept_name": row['original_name']})
+    cur2.close()
+    cur.execute("SELECT COUNT(*) AS remaining FROM rides f JOIN rides o ON f.possible_duplicate_of = o.id WHERE f.user_id=%s", (user['id'],))
+    remaining = cur.fetchone()['remaining']
+    cur.close(); conn.close()
+    return {"deleted_count": len(deleted), "deleted": deleted, "remaining_for_review": remaining}
 
 @app.get("/rides/flagged")
 def get_flagged_rides(user: dict = Depends(get_current_user)):
