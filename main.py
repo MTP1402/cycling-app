@@ -1,11 +1,35 @@
 # ═══════════════════════════════════════════════════════════════════
 # CYCLING COACH API — main.py
 #
-# VERSION: 2.20.1  (2026-08-05)
+# VERSION: 2.20.2  (2026-08-06)
 # Check this against GET / on the live Railway URL before assuming
 # a deploy has actually landed — the two should always match.
 #
 # CHANGELOG
+#   2.20.2 (2026-08-06) — real bug, confirmed live on Marc's account:
+#                         deleting the "original" side of a flagged
+#                         duplicate pair failed with "Couldn't delete,"
+#                         and the new bulk cleanup endpoint (v2.20.1)
+#                         failed outright too. Root cause: the
+#                         possible_duplicate_of column referenced
+#                         rides(id) with no ON DELETE behavior
+#                         specified, which Postgres defaults to
+#                         RESTRICT — so deleting any ride that another
+#                         row pointed to via possible_duplicate_of
+#                         (common here, since several flagged rows
+#                         can share the same original) hit an
+#                         unhandled foreign-key violation. Fixed the
+#                         constraint to ON DELETE SET NULL — deleting
+#                         a ride now correctly clears the flag on
+#                         anything that pointed to it instead of
+#                         blocking the delete. Also hardened both
+#                         delete_ride and cleanup_exact_duplicates
+#                         with real error handling: a delete failure
+#                         now returns an actual message instead of a
+#                         bare 500, and the cleanup batch no longer
+#                         aborts entirely if one row can't be deleted
+#                         — it collects that failure and keeps going
+#                         on the rest.
 #   2.20.1 (2026-08-05) — v2.20.0's ID check only caught re-syncs of
 #                         rows that ALREADY had a strava_activity_id
 #                         stored — every row synced before that fix
@@ -1039,7 +1063,7 @@
 #   1.0.0                initial live build — dashboard, FIT upload,
 #                         Strava OAuth + sync, AI profile interview
 # ═══════════════════════════════════════════════════════════════════
-APP_VERSION = "2.20.1"
+APP_VERSION = "2.20.2"
 ADMIN_EMAILS = {"mtpujol@gmail.com"}
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Form
@@ -1192,6 +1216,19 @@ def init_db():
         ALTER TABLE rides ADD COLUMN IF NOT EXISTS equipment_id INTEGER REFERENCES equipment(id);
         ALTER TABLE rides ADD COLUMN IF NOT EXISTS start_time TIMESTAMP;
         ALTER TABLE rides ADD COLUMN IF NOT EXISTS possible_duplicate_of INTEGER REFERENCES rides(id);
+        -- v2.20.2 fix: the line above left possible_duplicate_of with NO DELETE
+        -- behavior specified, which Postgres defaults to RESTRICT — so deleting
+        -- any ride that another row points to as "duplicate of" (extremely
+        -- common here, since several flagged rows can share the same original)
+        -- was throwing an unhandled foreign-key violation and failing outright.
+        -- Confirmed live: deleting the "original" side of a flagged pair threw
+        -- "Couldn't delete," and the bulk cleanup endpoint hit the same wall
+        -- whenever it tried to delete a row that a later duplicate-of-a-
+        -- duplicate pointed back to. Deleting a ride should just clear the flag
+        -- on whatever pointed to it, not block the delete.
+        ALTER TABLE rides DROP CONSTRAINT IF EXISTS rides_possible_duplicate_of_fkey;
+        ALTER TABLE rides ADD CONSTRAINT rides_possible_duplicate_of_fkey
+            FOREIGN KEY (possible_duplicate_of) REFERENCES rides(id) ON DELETE SET NULL;
         ALTER TABLE rides ADD COLUMN IF NOT EXISTS strava_activity_id BIGINT;
         ALTER TABLE profiles ADD COLUMN IF NOT EXISTS timezone TEXT;
     """)
@@ -3683,10 +3720,16 @@ def clear_rides(user: dict = Depends(get_current_user)):
 @app.delete("/rides/{ride_id}")
 def delete_ride(ride_id: int, user: dict = Depends(get_current_user)):
     """Delete a single ride. ride_streams cleans up automatically
-    (ON DELETE CASCADE) since it's keyed off ride_id."""
+    (ON DELETE CASCADE), and as of v2.20.2 so does any row that pointed
+    at this one via possible_duplicate_of (ON DELETE SET NULL) — both
+    keyed off ride_id, neither can block this delete anymore."""
     conn = get_db(); cur = conn.cursor()
-    cur.execute("DELETE FROM rides WHERE id=%s AND user_id=%s", (ride_id, user['id']))
-    deleted = cur.rowcount
+    try:
+        cur.execute("DELETE FROM rides WHERE id=%s AND user_id=%s", (ride_id, user['id']))
+        deleted = cur.rowcount
+    except Exception as e:
+        cur.close(); conn.close()
+        raise HTTPException(status_code=500, detail=f"Delete failed: {e}")
     cur.close(); conn.close()
     if not deleted:
         raise HTTPException(status_code=404, detail="Ride not found")
@@ -3781,15 +3824,22 @@ def cleanup_exact_duplicates(user: dict = Depends(get_current_user)):
     """, (user['id'],))
     exact_dupes = cur.fetchall()
     deleted = []
+    failed = []
     cur2 = conn.cursor()
     for row in exact_dupes:
-        cur2.execute("DELETE FROM rides WHERE id=%s AND user_id=%s", (row['flagged_id'], user['id']))
-        deleted.append({"deleted_id": row['flagged_id'], "deleted_name": row['flagged_name'], "kept_id": row['original_id'], "kept_name": row['original_name']})
+        try:
+            cur2.execute("DELETE FROM rides WHERE id=%s AND user_id=%s", (row['flagged_id'], user['id']))
+            deleted.append({"deleted_id": row['flagged_id'], "deleted_name": row['flagged_name'], "kept_id": row['original_id'], "kept_name": row['original_name']})
+        except Exception as e:
+            # Don't let one bad row abort the rest of the batch — collect it
+            # and keep going, so a single edge case doesn't block cleanup of
+            # everything else that's perfectly safe to delete.
+            failed.append({"ride_id": row['flagged_id'], "error": str(e)})
     cur2.close()
     cur.execute("SELECT COUNT(*) AS remaining FROM rides f JOIN rides o ON f.possible_duplicate_of = o.id WHERE f.user_id=%s", (user['id'],))
     remaining = cur.fetchone()['remaining']
     cur.close(); conn.close()
-    return {"deleted_count": len(deleted), "deleted": deleted, "remaining_for_review": remaining}
+    return {"deleted_count": len(deleted), "deleted": deleted, "remaining_for_review": remaining, "failed": failed}
 
 @app.get("/rides/flagged")
 def get_flagged_rides(user: dict = Depends(get_current_user)):
