@@ -1,11 +1,57 @@
 # ═══════════════════════════════════════════════════════════════════
 # CYCLING COACH API — main.py
 #
-# VERSION: 2.20.2  (2026-08-06)
+# VERSION: 2.22.0  (2026-08-06)
 # Check this against GET / on the live Railway URL before assuming
 # a deploy has actually landed — the two should always match.
 #
 # CHANGELOG
+#   2.22.0 (2026-08-06) — added GET /rides/scan-duplicates, a
+#                         diagnostic (not part of normal app flow) for
+#                         the mile/ride-count discrepancy Marc found
+#                         between the dashboard and Strava's own YTD
+#                         totals, with no unresolved pairs sitting in
+#                         Possible Duplicate Rides to explain it. The
+#                         normal flagging only ever runs at insert
+#                         time against whatever existed in the
+#                         database then — a duplicate created before
+#                         that logic existed, or that slipped through
+#                         a since-fixed gap in it, would be totally
+#                         invisible to that card while still counting
+#                         toward every dashboard total forever. This
+#                         scans every pair of the user's rides for the
+#                         year exhaustively, checking (in order) a
+#                         matching strava_activity_id, time-window
+#                         overlap, and — even when both sides have a
+#                         start_time that technically didn't overlap,
+#                         in case a timezone quirk shifted one copy —
+#                         distance/duration closeness, regardless of
+#                         each row's current flag state. Verified
+#                         against synthetic cases covering all three
+#                         detection paths plus a true-negative pair,
+#                         not just read through.
+#   2.21.0 (2026-08-06) — Dashboard cleanup at Marc's request: removed
+#                         the "Average Power per Ride" and "Average
+#                         Heart Rate per Ride" line charts from
+#                         Per-Ride Trends, since Coaching Analytics
+#                         already covers the same ground with Avg vs
+#                         Normalized Power and Avg vs Max HR (worth
+#                         noting: Per-Ride Trends plotted every ride,
+#                         Coaching Analytics filters to rides >=5mi —
+#                         not literally identical data, but close
+#                         enough that the redundancy wasn't worth the
+#                         clutter). Also converted the three remaining
+#                         Coaching Analytics line charts (Avg vs Norm
+#                         Power, Avg vs Max HR, Avg vs Max Cadence)
+#                         from line to grouped bar charts — coachSprint
+#                         was already a bar/line combo and is
+#                         untouched. Updated the section caption from
+#                         the old "solid/dashed line" convention to
+#                         "lighter/darker bar." Verified by running
+#                         build_full_dashboard() directly against
+#                         synthetic data and syntax-checking the
+#                         generated JS, not just eyeballing the
+#                         Python source.
 #   2.20.2 (2026-08-06) — real bug, confirmed live on Marc's account:
 #                         deleting the "original" side of a flagged
 #                         duplicate pair failed with "Couldn't delete,"
@@ -1063,7 +1109,7 @@
 #   1.0.0                initial live build — dashboard, FIT upload,
 #                         Strava OAuth + sync, AI profile interview
 # ═══════════════════════════════════════════════════════════════════
-APP_VERSION = "2.20.2"
+APP_VERSION = "2.22.0"
 ADMIN_EMAILS = {"mtpujol@gmail.com"}
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Form
@@ -1657,25 +1703,23 @@ def build_full_dashboard(rides, name, annual_goal=None, user_timezone=None):
         + "</div>"
     )
     js_elev  = "barChart('elevBar'," + j(ride_dates) + ",[{label:'Elev Gain (ft)',data:" + j(ride_elev) + ",backgroundColor:ORANGE+'CC'}],{zoomable:true});"
-    js_pwr   = "lineChart('powerLine'," + j(ride_dates) + ",[{label:'Avg Power (W)',data:" + j(ride_power) + ",borderColor:RED,backgroundColor:RED+'20',fill:false,spanGaps:true}],{zoomable:true});"
-    js_hr    = "lineChart('hrLine'," + j(ride_dates) + ",[{label:'Avg HR (bpm)',data:" + j(ride_hr) + ",borderColor:'#E91E63',backgroundColor:'#E91E6320',fill:false,spanGaps:true}],{zoomable:true});"
 
     js_coach_pwr = (
-        "lineChart('coachPower'," + j(coach_dates) + ","
-        "[{label:'Avg Power (W)',data:" + j(coach_avgpwr) + ",borderColor:BLUE,backgroundColor:BLUE+'20',fill:false,spanGaps:true},"
-        "{label:'Norm Power (W)',data:" + j(coach_np) + ",borderColor:'#1a5276',borderDash:[6,3],borderWidth:2,pointRadius:2,fill:false,spanGaps:true}],"
+        "barChart('coachPower'," + j(coach_dates) + ","
+        "[{label:'Avg Power (W)',data:" + j(coach_avgpwr) + ",backgroundColor:BLUE+'CC'},"
+        "{label:'Norm Power (W)',data:" + j(coach_np) + ",backgroundColor:'#1a5276CC'}],"
         "{zoomable:true,plugins:{tooltip:{mode:'index',intersect:false,itemSort:function(a,b){return b.datasetIndex-a.datasetIndex;}}}});"
     )
     js_coach_hr = (
-        "lineChart('coachHR'," + j(coach_dates) + ","
-        "[{label:'Avg HR (bpm)',data:" + j(coach_avghr) + ",borderColor:'#E91E63',backgroundColor:'#E91E6320',fill:false,spanGaps:true},"
-        "{label:'Max HR (bpm)',data:" + j(coach_maxhr) + ",borderColor:'#880e4f',borderDash:[6,3],borderWidth:2,pointRadius:2,fill:false,spanGaps:true}],"
+        "barChart('coachHR'," + j(coach_dates) + ","
+        "[{label:'Avg HR (bpm)',data:" + j(coach_avghr) + ",backgroundColor:'#E91E63CC'},"
+        "{label:'Max HR (bpm)',data:" + j(coach_maxhr) + ",backgroundColor:'#880e4fCC'}],"
         "{zoomable:true,plugins:{tooltip:{mode:'index',intersect:false,itemSort:function(a,b){return b.datasetIndex-a.datasetIndex;}}}});"
     )
     js_coach_cad = (
-        "lineChart('coachCad'," + j(coach_dates) + ","
-        "[{label:'Avg Cadence (rpm)',data:" + j(coach_avgcad) + ",borderColor:'#E67E22',backgroundColor:'#E67E2220',fill:false,spanGaps:true},"
-        "{label:'Max Cadence (rpm)',data:" + j(coach_maxcad) + ",borderColor:'#784212',borderDash:[6,3],borderWidth:2,pointRadius:2,fill:false,spanGaps:true}],"
+        "barChart('coachCad'," + j(coach_dates) + ","
+        "[{label:'Avg Cadence (rpm)',data:" + j(coach_avgcad) + ",backgroundColor:'#E67E22CC'},"
+        "{label:'Max Cadence (rpm)',data:" + j(coach_maxcad) + ",backgroundColor:'#784212CC'}],"
         "{zoomable:true,plugins:{tooltip:{mode:'index',intersect:false,itemSort:function(a,b){return b.datasetIndex-a.datasetIndex;}}}});"
     )
     js_sprint_p5  = j(coach_p5)
@@ -1791,13 +1835,11 @@ def build_full_dashboard(rides, name, annual_goal=None, user_timezone=None):
         + range_bar_html
         + "<div class='charts-grid'>"
         + "<div class='chart-card'><h3>&#x26F0; Elevation Gain per Ride (ft) <a href='#' onclick=\"resetZoom('elevBar');return false;\" style='float:right;font-size:10px;color:#888;font-weight:400;text-decoration:none;'>&#8635; reset zoom</a></h3><canvas id='elevBar'></canvas></div>"
-        + "<div class='chart-card'><h3>&#x26A1; Average Power per Ride (W) <a href='#' onclick=\"resetZoom('powerLine');return false;\" style='float:right;font-size:10px;color:#888;font-weight:400;text-decoration:none;'>&#8635; reset zoom</a></h3><canvas id='powerLine'></canvas></div>"
-        + "<div class='chart-card'><h3>&#x2764; Average Heart Rate per Ride (bpm) <a href='#' onclick=\"resetZoom('hrLine');return false;\" style='float:right;font-size:10px;color:#888;font-weight:400;text-decoration:none;'>&#8635; reset zoom</a></h3><canvas id='hrLine'></canvas></div>"
         + "</div>"
 
         + "<div class='section-header'>"
         + "<h2>&#x1F3C6; Coaching Analytics &#x2014; Power &middot; Heart Rate &middot; Cadence &middot; Sprint Power</h2>"
-        + "<p>Solid line = average &nbsp;&middot;&nbsp; Dashed line = max/normalized &nbsp;&middot;&nbsp; All rides &#x2265; 5 miles &nbsp;&middot;&nbsp; Pinch or scroll to zoom, tap &#8635; to reset</p>"
+        + "<p>Lighter bar = average &nbsp;&middot;&nbsp; Darker bar = max/normalized &nbsp;&middot;&nbsp; All rides &#x2265; 5 miles &nbsp;&middot;&nbsp; Pinch or scroll to zoom, tap &#8635; to reset</p>"
         + "</div>"
         + range_bar_html
         + "<div class='charts-grid'>"
@@ -1821,15 +1863,13 @@ def build_full_dashboard(rides, name, annual_goal=None, user_timezone=None):
         + "function resetZoom(id){if(CHARTS[id])CHARTS[id].resetZoom();}"
         + "const RIDE_DATE_ISO={"
         + "elevBar:" + j(ride_dates_iso) + ","
-        + "powerLine:" + j(ride_dates_iso) + ","
-        + "hrLine:" + j(ride_dates_iso) + ","
         + "coachPower:" + j(coach_dates_iso) + ","
         + "coachHR:" + j(coach_dates_iso) + ","
         + "coachCad:" + j(coach_dates_iso) + ","
         + "coachSprint:" + j(coach_dates_iso)
         + "};"
         + "function setRange(range){"
-        + "var ids=['elevBar','powerLine','hrLine','coachPower','coachHR','coachCad','coachSprint'];"
+        + "var ids=['elevBar','coachPower','coachHR','coachCad','coachSprint'];"
         + "ids.forEach(function(id){"
         + "var chart=CHARTS[id];if(!chart)return;"
         + "if(range==='all'){chart.resetZoom();return;}"
@@ -1871,8 +1911,6 @@ def build_full_dashboard(rides, name, annual_goal=None, user_timezone=None):
         + js_rt_mi
         + js_rt_hr
         + js_elev
-        + js_pwr
-        + js_hr
         + js_coach_pwr
         + js_coach_hr
         + js_coach_cad
@@ -3840,6 +3878,74 @@ def cleanup_exact_duplicates(user: dict = Depends(get_current_user)):
     remaining = cur.fetchone()['remaining']
     cur.close(); conn.close()
     return {"deleted_count": len(deleted), "deleted": deleted, "remaining_for_review": remaining, "failed": failed}
+
+@app.get("/rides/scan-duplicates")
+def scan_duplicates(user: dict = Depends(get_current_user)):
+    """Diagnostic, not part of normal flow: the 'Possible Duplicate Rides'
+    card only ever reflects possible_duplicate_of, which is only ever SET
+    at insert time, compared against whatever existed in the database at
+    that exact moment. A duplicate pair created before that logic existed,
+    or that fell through some now-fixed gap in it, would sit in the rides
+    table completely unflagged, forever — invisible to that card, but
+    still counted in every dashboard total. This scans every pair of the
+    user's rides for the year exhaustively (not just against what existed
+    at insert time) using the same overlap/closeness criteria as sync and
+    upload, and reports anything that looks like a duplicate regardless
+    of its current flag state."""
+    conn = get_db(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("""SELECT id, ride_date, start_time, elapsed_h, name, dist_mi, duration_h,
+                          avg_power, avg_hr, possible_duplicate_of, strava_activity_id
+                   FROM rides WHERE user_id=%s AND ride_date >= %s AND ride_date < %s
+                   ORDER BY ride_date""",
+                (user['id'], f'{YEAR}-01-01', f'{YEAR+1}-01-01'))
+    rides = cur.fetchall()
+    cur.close(); conn.close()
+
+    def end_time(r):
+        if r['start_time'] and r['elapsed_h']:
+            try:
+                return datetime.fromisoformat(str(r['start_time'])) + timedelta(hours=float(r['elapsed_h']))
+            except Exception:
+                return None
+        return None
+
+    pairs = []
+    for i in range(len(rides)):
+        for k in range(i + 1, len(rides)):
+            a, b = rides[i], rides[k]
+            if abs((a['ride_date'] - b['ride_date']).days) > 1:
+                continue
+            overlap = False
+            # Same Strava activity ID on both sides is a guaranteed duplicate
+            # regardless of what start_time says — checked first since it's
+            # the strongest possible signal and immune to any timezone-related
+            # drift in the time-overlap check below.
+            if a['strava_activity_id'] and b['strava_activity_id'] and a['strava_activity_id'] == b['strava_activity_id']:
+                overlap = True
+            a_end = end_time(a); b_end = end_time(b)
+            if not overlap and a['start_time'] and b['start_time'] and a_end and b_end:
+                a_start = datetime.fromisoformat(str(a['start_time']))
+                b_start = datetime.fromisoformat(str(b['start_time']))
+                if a_start <= b_end and b_start <= a_end:
+                    overlap = True
+            # Runs even when both sides HAVE a start_time that didn't overlap
+            # above — a timezone quirk could shift one copy's start_time
+            # enough to miss the overlap check while distance/duration still
+            # give it away. Tight tolerances keep this from over-firing on
+            # two genuinely different same-day rides.
+            if not overlap and (abs((a['dist_mi'] or 0) - (b['dist_mi'] or 0)) < 0.5
+                    and abs((a['duration_h'] or 0) - (b['duration_h'] or 0)) < 0.1):
+                overlap = True
+            if overlap:
+                def slim(r):
+                    return {"id": r['id'], "name": r['name'], "date": str(r['ride_date']),
+                            "dist_mi": r['dist_mi'], "duration_h": r['duration_h'],
+                            "avg_power": r['avg_power'], "avg_hr": r['avg_hr'],
+                            "currently_flagged": r['possible_duplicate_of'] is not None,
+                            "strava_activity_id": r['strava_activity_id']}
+                pairs.append({"a": slim(a), "b": slim(b)})
+
+    return {"total_rides_scanned": len(rides), "possible_duplicate_pairs_found": len(pairs), "pairs": pairs}
 
 @app.get("/rides/flagged")
 def get_flagged_rides(user: dict = Depends(get_current_user)):
