@@ -1,11 +1,57 @@
 # ═══════════════════════════════════════════════════════════════════
 # CYCLING COACH API — main.py
 #
-# VERSION: 2.22.0  (2026-08-06)
+# VERSION: 2.23.0  (2026-08-13)
 # Check this against GET / on the live Railway URL before assuming
 # a deploy has actually landed — the two should always match.
 #
 # CHANGELOG
+#   2.23.0 (2026-08-13) — real bug, confirmed live on Marc's account:
+#                         two separate FIT-vs-Strava duplicate pairs
+#                         (Aug 8, Aug 12 — the same physical ride
+#                         uploaded from the Karoo AND pulled in via
+#                         Strava sync) went completely unflagged by
+#                         every dedup check, despite both copies
+#                         having a valid start_time. Root cause: FIT
+#                         files store timestamps in UTC per the FIT
+#                         protocol spec, and parse_fit_bytes() used
+#                         that value as-is with no conversion, while
+#                         strava_sync() explicitly reads Strava's
+#                         start_date_local field. The two ingestion
+#                         paths were storing start_time in two
+#                         different timezones — 5 hours apart for
+#                         Houston/CDT — so two recordings of the same
+#                         ride no longer looked like they happened at
+#                         the same time to any overlap check. Verified:
+#                         the wrongly-UTC FIT timestamps were within 2
+#                         seconds of their Strava counterpart once
+#                         converted to local time. Fixed with a new
+#                         convert_fit_utc_to_local() helper, applied in
+#                         parse_fit_bytes() using the uploading user's
+#                         stored timezone (same profiles.timezone
+#                         column already used everywhere else),
+#                         defaulting to America/Chicago. This only
+#                         fixes FIT uploads going forward — existing
+#                         FIT-uploaded rows still have their start_time
+#                         stored in UTC and haven't been corrected.
+#                         Also, at Marc's request: converted the
+#                         Coaching Analytics grouped bars (Avg vs Norm
+#                         Power, Avg vs Max HR, Avg vs Max Cadence)
+#                         from two full-height bars per ride into one
+#                         stacked bar per ride, matching Sprint Power's
+#                         visual style. Unlike Sprint Power's tiers
+#                         (genuinely nested sub-durations that sum
+#                         sensibly), avg-vs-max/normalized aren't
+#                         additive, so stacking the raw values would've
+#                         summed to a meaningless total — the base
+#                         segment is the average, the top segment is
+#                         just the remainder up to max/normalized, so
+#                         the two segments stack to the right total.
+#                         Tooltips show the real avg and max/normalized
+#                         values, not the raw delta. Verified against
+#                         synthetic data including a ride with missing
+#                         power data, to confirm the None-handling path
+#                         doesn't crash the delta calculation.
 #   2.22.0 (2026-08-06) — added GET /rides/scan-duplicates, a
 #                         diagnostic (not part of normal app flow) for
 #                         the mile/ride-count discrepancy Marc found
@@ -1109,7 +1155,7 @@
 #   1.0.0                initial live build — dashboard, FIT upload,
 #                         Strava OAuth + sync, AI profile interview
 # ═══════════════════════════════════════════════════════════════════
-APP_VERSION = "2.22.0"
+APP_VERSION = "2.23.0"
 ADMIN_EMAILS = {"mtpujol@gmail.com"}
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Form
@@ -1335,7 +1381,30 @@ def classify_ride(dist_mi, duration_h, avg_power, is_virtual):
         return 'Recovery/Rehab'
     return 'General'
 
-def parse_fit_bytes(data):
+def convert_fit_utc_to_local(dt, tz_name=None):
+    """FIT files store timestamps in UTC per the FIT protocol spec — fitparse
+    returns them as-is, with no timezone conversion applied. Strava sync, by
+    contrast, explicitly reads start_date_local (see strava_sync below). Left
+    unreconciled, a FIT-uploaded copy of a ride and its Strava-synced
+    counterpart end up with start_time values hours apart — 5 hours for
+    Houston/CDT — which silently defeats every overlap-based duplicate check,
+    since the two recordings of the very same physical ride no longer look
+    like they happened at the same time. Confirmed live on Marc's account:
+    two separate FIT-vs-Strava pairs (Aug 8, Aug 12) both went completely
+    unflagged, each with start_time exactly 5 hours apart between the two
+    copies. Converts the naive UTC datetime fitparse returns to the user's
+    local wall-clock time, stored naive (no tzinfo) to match the existing
+    column convention."""
+    if dt is None:
+        return None
+    tz_name = tz_name or 'America/Chicago'
+    try:
+        aware_utc = dt.replace(tzinfo=ZoneInfo('UTC')) if dt.tzinfo is None else dt
+        return aware_utc.astimezone(ZoneInfo(tz_name)).replace(tzinfo=None)
+    except Exception:
+        return dt
+
+def parse_fit_bytes(data, tz_name=None):
     try:
         import fitparse
         with tempfile.NamedTemporaryFile(suffix='.fit', delete=False) as tmp:
@@ -1410,6 +1479,7 @@ def parse_fit_bytes(data):
         avg_lr_balance = round(sum(lr_vals) / len(lr_vals), 1) if lr_vals else None
 
         start   = session.get('start_time')
+        start   = convert_fit_utc_to_local(start, tz_name)
         dist    = session.get('total_distance')
         # Moving time (auto-pause excluded) as the primary duration — matches
         # Strava sync's convention (moving_time), so a ride's numbers don't
@@ -1587,6 +1657,27 @@ def build_full_dashboard(rides, name, annual_goal=None, user_timezone=None):
     coach_maxhr  = [r.get('max_hr')      for r in coach_rides]
     coach_avgcad = [r.get('avg_cadence') for r in coach_rides]
     coach_maxcad = [r.get('max_cadence') for r in coach_rides]
+    def _delta(base_list, top_list):
+        # v2.23.0: Marc asked for these to read as ONE bar per ride with two
+        # colors, like Sprint Power's stacked segments, instead of two
+        # full-height bars side by side. Unlike Sprint Power's tiers (which
+        # are genuinely nested sub-durations that sum sensibly), avg-vs-max
+        # and avg-vs-normalized aren't additive — stacking the two raw
+        # values would sum to a meaningless total. So the base segment is
+        # the average (always <= the max/normalized counterpart by
+        # definition) and the second segment is just the remainder on top,
+        # so the two segments stack to exactly the max/normalized value,
+        # not to avg+max.
+        out = []
+        for base, top in zip(base_list, top_list):
+            if base is None or top is None:
+                out.append(None)
+            else:
+                out.append(round(top - base, 1) if top > base else 0)
+        return out
+    coach_pwr_delta = _delta(coach_avgpwr, coach_np)
+    coach_hr_delta  = _delta(coach_avghr, coach_maxhr)
+    coach_cad_delta = _delta(coach_avgcad, coach_maxcad)
     coach_p5     = [r.get('p5')  for r in coach_rides]
     coach_p10    = [r.get('p15') for r in coach_rides]
     coach_p20    = [r.get('p30') for r in coach_rides]
@@ -1705,22 +1796,40 @@ def build_full_dashboard(rides, name, annual_goal=None, user_timezone=None):
     js_elev  = "barChart('elevBar'," + j(ride_dates) + ",[{label:'Elev Gain (ft)',data:" + j(ride_elev) + ",backgroundColor:ORANGE+'CC'}],{zoomable:true});"
 
     js_coach_pwr = (
+        "var _cpAvg=" + j(coach_avgpwr) + ",_cpTop=" + j(coach_np) + ";"
         "barChart('coachPower'," + j(coach_dates) + ","
-        "[{label:'Avg Power (W)',data:" + j(coach_avgpwr) + ",backgroundColor:BLUE+'CC'},"
-        "{label:'Norm Power (W)',data:" + j(coach_np) + ",backgroundColor:'#1a5276CC'}],"
-        "{zoomable:true,plugins:{tooltip:{mode:'index',intersect:false,itemSort:function(a,b){return b.datasetIndex-a.datasetIndex;}}}});"
+        "[{label:'Avg Power (W)',data:_cpAvg,backgroundColor:BLUE+'CC',stack:'p'},"
+        "{label:'+ to Normalized (W)',data:" + j(coach_pwr_delta) + ",backgroundColor:'#1a5276CC',stack:'p'}],"
+        "{scales:{y:{stacked:true,beginAtZero:true},x:{stacked:true,ticks:{maxRotation:45}}},"
+        "zoomable:true,plugins:{tooltip:{mode:'index',intersect:false,"
+        "callbacks:{label:function(ctx){var i=ctx.dataIndex;"
+        "if(ctx.datasetIndex===0)return 'Avg: '+(_cpAvg[i]!=null?_cpAvg[i]+'W':'-');"
+        "return 'Normalized: '+(_cpTop[i]!=null?_cpTop[i]+'W':'-');"
+        "}}}}});"
     )
     js_coach_hr = (
+        "var _chAvg=" + j(coach_avghr) + ",_chTop=" + j(coach_maxhr) + ";"
         "barChart('coachHR'," + j(coach_dates) + ","
-        "[{label:'Avg HR (bpm)',data:" + j(coach_avghr) + ",backgroundColor:'#E91E63CC'},"
-        "{label:'Max HR (bpm)',data:" + j(coach_maxhr) + ",backgroundColor:'#880e4fCC'}],"
-        "{zoomable:true,plugins:{tooltip:{mode:'index',intersect:false,itemSort:function(a,b){return b.datasetIndex-a.datasetIndex;}}}});"
+        "[{label:'Avg HR (bpm)',data:_chAvg,backgroundColor:'#E91E63CC',stack:'h'},"
+        "{label:'+ to Max (bpm)',data:" + j(coach_hr_delta) + ",backgroundColor:'#880e4fCC',stack:'h'}],"
+        "{scales:{y:{stacked:true,beginAtZero:true},x:{stacked:true,ticks:{maxRotation:45}}},"
+        "zoomable:true,plugins:{tooltip:{mode:'index',intersect:false,"
+        "callbacks:{label:function(ctx){var i=ctx.dataIndex;"
+        "if(ctx.datasetIndex===0)return 'Avg: '+(_chAvg[i]!=null?_chAvg[i]+'bpm':'-');"
+        "return 'Max: '+(_chTop[i]!=null?_chTop[i]+'bpm':'-');"
+        "}}}}});"
     )
     js_coach_cad = (
+        "var _ccAvg=" + j(coach_avgcad) + ",_ccTop=" + j(coach_maxcad) + ";"
         "barChart('coachCad'," + j(coach_dates) + ","
-        "[{label:'Avg Cadence (rpm)',data:" + j(coach_avgcad) + ",backgroundColor:'#E67E22CC'},"
-        "{label:'Max Cadence (rpm)',data:" + j(coach_maxcad) + ",backgroundColor:'#784212CC'}],"
-        "{zoomable:true,plugins:{tooltip:{mode:'index',intersect:false,itemSort:function(a,b){return b.datasetIndex-a.datasetIndex;}}}});"
+        "[{label:'Avg Cadence (rpm)',data:_ccAvg,backgroundColor:'#E67E22CC',stack:'c'},"
+        "{label:'+ to Max (rpm)',data:" + j(coach_cad_delta) + ",backgroundColor:'#784212CC',stack:'c'}],"
+        "{scales:{y:{stacked:true,beginAtZero:true},x:{stacked:true,ticks:{maxRotation:45}}},"
+        "zoomable:true,plugins:{tooltip:{mode:'index',intersect:false,"
+        "callbacks:{label:function(ctx){var i=ctx.dataIndex;"
+        "if(ctx.datasetIndex===0)return 'Avg: '+(_ccAvg[i]!=null?_ccAvg[i]+'rpm':'-');"
+        "return 'Max: '+(_ccTop[i]!=null?_ccTop[i]+'rpm':'-');"
+        "}}}}});"
     )
     js_sprint_p5  = j(coach_p5)
     js_sprint_p10 = j(coach_p10)
@@ -1839,7 +1948,7 @@ def build_full_dashboard(rides, name, annual_goal=None, user_timezone=None):
 
         + "<div class='section-header'>"
         + "<h2>&#x1F3C6; Coaching Analytics &#x2014; Power &middot; Heart Rate &middot; Cadence &middot; Sprint Power</h2>"
-        + "<p>Lighter bar = average &nbsp;&middot;&nbsp; Darker bar = max/normalized &nbsp;&middot;&nbsp; All rides &#x2265; 5 miles &nbsp;&middot;&nbsp; Pinch or scroll to zoom, tap &#8635; to reset</p>"
+        + "<p>Base bar = average &nbsp;&middot;&nbsp; Top segment = extra up to max/normalized &nbsp;&middot;&nbsp; All rides &#x2265; 5 miles &nbsp;&middot;&nbsp; Pinch or scroll to zoom, tap &#8635; to reset</p>"
         + "</div>"
         + range_bar_html
         + "<div class='charts-grid'>"
@@ -2432,7 +2541,12 @@ def login(email: str = Form(...), password: str = Form(...)):
 async def upload_fit(file: UploadFile = File(...), notes: str = Form(default=""),
                      user: dict = Depends(get_current_user)):
     data    = await file.read()
-    metrics = parse_fit_bytes(data)
+    conn = get_db(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT timezone FROM profiles WHERE user_id=%s", (user['id'],))
+    profile_row = cur.fetchone()
+    cur.close(); conn.close()
+    tz_name = profile_row.get('timezone') if profile_row else None
+    metrics = parse_fit_bytes(data, tz_name)
     NON_CYCLING_FIT_SPORTS = {"running", "walking", "hiking", "swimming"}
     if metrics.get('sport') in NON_CYCLING_FIT_SPORTS:
         raise HTTPException(status_code=400,
