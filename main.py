@@ -1,11 +1,32 @@
 # ═══════════════════════════════════════════════════════════════════
 # CYCLING COACH API — main.py
 #
-# VERSION: 2.23.0  (2026-08-13)
+# VERSION: 2.23.1  (2026-08-13)
 # Check this against GET / on the live Railway URL before assuming
 # a deploy has actually landed — the two should always match.
 #
 # CHANGELOG
+#   2.23.1 (2026-08-13) — at Marc's explicit request: removed the
+#                         v2.20.1 backfill-and-skip behavior for
+#                         time-overlap matches in strava_sync(). That
+#                         behavior was a one-time aid for legacy rows
+#                         that predated strava_activity_id tracking —
+#                         but going forward it would silently swallow
+#                         every genuine FIT-vs-Strava duplicate instead
+#                         of flagging it for review, since a FIT-
+#                         uploaded ride will permanently have no
+#                         strava_activity_id (it's not from Strava).
+#                         Marc wants the choice every time a ride comes
+#                         in through both paths — either source can be
+#                         the more complete recording depending on the
+#                         day (dead Karoo battery, interrupted phone
+#                         recording, etc.), so there's no single rule
+#                         for which one should silently win. A true
+#                         re-sync of the same Strava activity is still
+#                         caught cleanly by the exact strava_activity_id
+#                         match, which runs first and is unaffected —
+#                         only genuine cross-source overlaps reach the
+#                         review queue now.
 #   2.23.0 (2026-08-13) — real bug, confirmed live on Marc's account:
 #                         two separate FIT-vs-Strava duplicate pairs
 #                         (Aug 8, Aug 12 — the same physical ride
@@ -1155,7 +1176,7 @@
 #   1.0.0                initial live build — dashboard, FIT upload,
 #                         Strava OAuth + sync, AI profile interview
 # ═══════════════════════════════════════════════════════════════════
-APP_VERSION = "2.23.0"
+APP_VERSION = "2.23.1"
 ADMIN_EMAILS = {"mtpujol@gmail.com"}
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Form
@@ -3738,26 +3759,22 @@ async def strava_sync(
                             (user['id'], act_date, new_end_time, start_time_val))
                         overlap_match = cur3.fetchone()
                         if overlap_match:
-                            existing_id = overlap_match[0]
-                            # v2.20.1 fix: the ID check above only catches re-syncs of
-                            # rows that ALREADY have a strava_activity_id stored — but
-                            # every row synced before v2.20.0 has NULL there, so this
-                            # overlap match kept hitting the insert-and-flag path below
-                            # on every single re-sync, same as before the ID check
-                            # existed. Reported by Marc: 7 flagged pairs became 11 on
-                            # the very next Sync Now, after the v2.20.0 fix was already
-                            # live. If we have a real Strava ID for this activity right
-                            # now and the matched existing row doesn't have one on file,
-                            # this overlap is almost certainly that same legacy row —
-                            # backfill it and skip cleanly rather than flag again.
-                            if strava_id is not None:
-                                cur3.execute("SELECT strava_activity_id FROM rides WHERE id=%s", (existing_id,))
-                                existing_strava_id = cur3.fetchone()[0]
-                                if existing_strava_id is None:
-                                    cur3.execute("UPDATE rides SET strava_activity_id=%s WHERE id=%s",
-                                                (strava_id, existing_id))
-                                    cur3.close(); skipped += 1; continue
-                            duplicate_of_id = existing_id
+                            # v2.23.1 fix: this branch used to backfill strava_activity_id
+                            # onto the matched row and skip silently (v2.20.1) whenever that
+                            # row had no ID on file. That was a one-time aid for legacy rows
+                            # that predated ID tracking — but going forward, EVERY FIT-
+                            # uploaded ride will permanently have no strava_activity_id
+                            # (it's not from Strava), so this branch would silently swallow
+                            # every genuine FIT-vs-Strava duplicate instead of flagging it
+                            # for review. Marc was explicit: he wants the choice, since
+                            # either source can be the more complete recording depending on
+                            # what happened that day (dead Karoo battery, interrupted phone
+                            # recording, etc.) — there's no single rule for which one wins.
+                            # A true re-sync of the same Strava activity is already caught
+                            # cleanly above by the exact strava_activity_id match, so
+                            # anything reaching this point is a genuine cross-source pair
+                            # that belongs in the review queue, not a silent merge.
+                            duplicate_of_id = overlap_match[0]
 
                     if duplicate_of_id is None:
                         cur3.execute("""SELECT id FROM rides WHERE user_id=%s
