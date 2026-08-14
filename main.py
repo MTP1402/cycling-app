@@ -1,11 +1,24 @@
 # ═══════════════════════════════════════════════════════════════════
 # CYCLING COACH API — main.py
 #
-# VERSION: 2.24.0  (2026-08-13)
+# VERSION: 2.24.1  (2026-08-13)
 # Check this against GET / on the live Railway URL before assuming
 # a deploy has actually landed — the two should always match.
 #
 # CHANGELOG
+#   2.24.1 (2026-08-13) — added POST /rides/{id}/set-strava-id, a manual
+#                         correction endpoint discovered necessary while
+#                         testing v2.24.0's auto-transfer live: the two
+#                         Aug 8/Aug 12 duplicate pairs predated v2.23.0's
+#                         timezone fix, so they were never actually
+#                         linked via possible_duplicate_of in the first
+#                         place (the old timezone bug meant the overlap
+#                         check never found them as a pair at all) — the
+#                         auto-transfer correctly found no counterpart
+#                         to transfer to, since none was ever recorded.
+#                         This lets a known Strava activity ID be
+#                         attached to a surviving row by hand for
+#                         exactly that situation.
 #   2.24.0 (2026-08-13) — Marc flagged a real recurring-conflict risk
 #                         before he'd even hit it: with v2.23.1 making
 #                         FIT-vs-Strava overlaps always flag (correctly,
@@ -1194,7 +1207,7 @@
 #   1.0.0                initial live build — dashboard, FIT upload,
 #                         Strava OAuth + sync, AI profile interview
 # ═══════════════════════════════════════════════════════════════════
-APP_VERSION = "2.24.0"
+APP_VERSION = "2.24.1"
 ADMIN_EMAILS = {"mtpujol@gmail.com"}
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Form
@@ -3955,6 +3968,26 @@ def delete_ride(ride_id: int, user: dict = Depends(get_current_user)):
     if not deleted:
         raise HTTPException(status_code=404, detail="Ride not found")
     return {"status": "deleted", "id": ride_id}
+
+@app.post("/rides/{ride_id}/set-strava-id")
+def set_strava_id(ride_id: int, strava_activity_id: int = Form(...), user: dict = Depends(get_current_user)):
+    """Manual correction, not part of normal app flow. The v2.24.0 auto-
+    transfer in delete_ride only works when a proper possible_duplicate_of
+    link exists between the two sides — rows that predate that link ever
+    being established (e.g. anything created back when the FIT-vs-Strava
+    timezone bug meant they never got flagged as a pair in the first
+    place) have no counterpart to transfer to automatically. This lets a
+    known Strava activity ID be attached directly to a surviving row by
+    hand, so it's protected from being re-created on a future sync same
+    as if the automatic transfer had run."""
+    conn = get_db(); cur = conn.cursor()
+    cur.execute("UPDATE rides SET strava_activity_id=%s WHERE id=%s AND user_id=%s",
+                (strava_activity_id, ride_id, user['id']))
+    updated = cur.rowcount
+    cur.close(); conn.close()
+    if not updated:
+        raise HTTPException(status_code=404, detail="Ride not found")
+    return {"status": "updated", "id": ride_id, "strava_activity_id": strava_activity_id}
 
 @app.get("/rides/audit-slow-pace")
 def audit_slow_pace(user: dict = Depends(get_current_user)):
