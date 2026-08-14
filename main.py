@@ -1,11 +1,37 @@
 # ═══════════════════════════════════════════════════════════════════
 # CYCLING COACH API — main.py
 #
-# VERSION: 2.24.1  (2026-08-13)
+# VERSION: 2.24.2  (2026-08-14)
 # Check this against GET / on the live Railway URL before assuming
 # a deploy has actually landed — the two should always match.
 #
 # CHANGELOG
+#   2.24.2 (2026-08-14) — real bug, caught by the coach's own assessment
+#                         text on Marc's Aug 12 ride: Normalized Power
+#                         (168W) came in below Average Power (198W),
+#                         which is mathematically impossible when both
+#                         are computed from the same data — the coach
+#                         assumed a bad ride file and flagged it as
+#                         such. It wasn't the file. avg_power is
+#                         deliberately computed from only non-zero
+#                         power readings (coasting excluded, to match
+#                         Strava's convention), but norm_power was
+#                         preferring the device's own session-level
+#                         normalized_power field, which the Karoo
+#                         computes over ALL samples including zeros.
+#                         Comparing a zero-excluded average against a
+#                         zero-included NP broke the NP >= avg-power
+#                         guarantee. Fixed to always use our own NP
+#                         calculation (already existed as a fallback,
+#                         computed from the identical zero-filtered
+#                         power list used for avg_power) instead of
+#                         the device's field. Verified against 200
+#                         synthetic rides of varying length and power
+#                         variability, including realistic coasting
+#                         patterns — zero cases of NP < avg after the
+#                         fix. This only affects FIT uploads going
+#                         forward; existing rows still have whatever
+#                         value the device reported.
 #   2.24.1 (2026-08-13) — added POST /rides/{id}/set-strava-id, a manual
 #                         correction endpoint discovered necessary while
 #                         testing v2.24.0's auto-transfer live: the two
@@ -1207,7 +1233,7 @@
 #   1.0.0                initial live build — dashboard, FIT upload,
 #                         Strava OAuth + sync, AI profile interview
 # ═══════════════════════════════════════════════════════════════════
-APP_VERSION = "2.24.1"
+APP_VERSION = "2.24.2"
 ADMIN_EMAILS = {"mtpujol@gmail.com"}
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Form
@@ -1491,6 +1517,16 @@ def parse_fit_bytes(data, tz_name=None):
             if not vals or len(vals) < n: return max(vals) if vals else None
             return round(max(sum(vals[i:i+n])/n for i in range(len(vals)-n+1)))
 
+        # v2.24.2 fix: always computed ourselves from the same zero-filtered
+        # `powers` list used for avg_power_val below — NOT the device's own
+        # session-level normalized_power field, which computes over ALL
+        # samples including zeros/coasting. Mixing a zero-excluded average
+        # with a zero-included NP broke the NP >= avg-power guarantee
+        # (confirmed live: Aug 12 showed NP 168W vs avg 198W, which the
+        # coach correctly flagged as "mathematically impossible" and
+        # assumed was a bad file — it wasn't the file, it was two different
+        # computation methods being compared against each other). Computing
+        # both from identical data restores the guarantee.
         np_val = None
         if powers and len(powers) > 30:
             smoothed = [sum(powers[max(0,i-29):i+1])/len(powers[max(0,i-29):i+1]) for i in range(len(powers))]
@@ -1574,7 +1610,7 @@ def parse_fit_bytes(data, tz_name=None):
             'dist_mi':     dist_mi,
             'duration_h':  duration_h,
             'avg_power':   avg_power_val,
-            'norm_power':  session.get('normalized_power') or np_val,
+            'norm_power':  np_val,
             'avg_hr':      session.get('avg_heart_rate'),
             'max_hr':      session.get('max_heart_rate'),
             'avg_cadence': session.get('avg_cadence'),
