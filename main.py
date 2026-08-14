@@ -1,11 +1,39 @@
 # ═══════════════════════════════════════════════════════════════════
 # CYCLING COACH API — main.py
 #
-# VERSION: 2.24.2  (2026-08-14)
+# VERSION: 2.25.0  (2026-08-14)
 # Check this against GET / on the live Railway URL before assuming
 # a deploy has actually landed — the two should always match.
 #
 # CHANGELOG
+#   2.25.0 (2026-08-14) — three fixes at Marc's request. (1) Removed
+#                         the "Latest Ride Assessment" card from
+#                         Dashboard — Marc correctly identified it as
+#                         redundant with Ride History. (2) The real fix
+#                         behind that: get_coaching_summary() only
+#                         wrote a Ride History entry (coaching_
+#                         memory_log) when the AI's own MEMORY_UPDATE
+#                         judged the ride "worth remembering" —
+#                         genuinely optional per its own prompt
+#                         instructions — while coaching_synopsis (the
+#                         now-removed Dashboard card) was written
+#                         unconditionally for every upload. That gap is
+#                         exactly why Marc's Aug 12 ride got a full
+#                         Dashboard assessment but never showed up in
+#                         Ride History, and presumably why Aug 8 didn't
+#                         either. Every assessed ride now always gets a
+#                         Ride History entry using its own date and the
+#                         same assessment text, via ON CONFLICT DO
+#                         NOTHING so it never overwrites a richer
+#                         summary the AI's own judgment already wrote.
+#                         (3) Added POST /rides/{id}/correct-field, a
+#                         general-purpose manual correction endpoint
+#                         restricted to a numeric-field allowlist, for
+#                         exactly the kind of one-off sensor-glitch fix
+#                         Marc needed today (a 202rpm max cadence on a
+#                         ride where the sensor wasn't actually
+#                         recording) — used it live to null out both
+#                         avg_cadence and max_cadence on ride #934.
 #   2.24.2 (2026-08-14) — real bug, caught by the coach's own assessment
 #                         text on Marc's Aug 12 ride: Normalized Power
 #                         (168W) came in below Average Power (198W),
@@ -1233,7 +1261,7 @@
 #   1.0.0                initial live build — dashboard, FIT upload,
 #                         Strava OAuth + sync, AI profile interview
 # ═══════════════════════════════════════════════════════════════════
-APP_VERSION = "2.24.2"
+APP_VERSION = "2.25.0"
 ADMIN_EMAILS = {"mtpujol@gmail.com"}
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Form
@@ -1641,22 +1669,6 @@ def build_full_dashboard(rides, name, annual_goal=None, user_timezone=None):
     goal = annual_goal or ANNUAL_GOAL
     sorted_rides = sorted(rides, key=lambda r: r['ride_date'] if r.get('ride_date') else date.min)
 
-    synopsis_card = ""
-    if sorted_rides:
-        latest = sorted_rides[-1]
-        synopsis = latest.get('coaching_synopsis')
-        if synopsis:
-            latest_date = latest.get('ride_date')
-            date_str = latest_date.strftime('%B %d, %Y') if hasattr(latest_date, 'strftime') else str(latest_date)
-            synopsis_card = (
-                "<div class='synopsis-card'>"
-                + "<div class='synopsis-label'>Latest Ride Assessment</div>"
-                + "<div class='synopsis-date'>" + html.escape(date_str) + " &nbsp;&middot;&nbsp; "
-                + html.escape(str(latest.get('name', 'Ride'))) + "</div>"
-                + "<div class='synopsis-text'>" + html.escape(synopsis) + "</div>"
-                + "</div>"
-            )
-
     def to_date(d):
         if isinstance(d, date): return d
         if isinstance(d, str): return date.fromisoformat(str(d)[:10])
@@ -1990,8 +2002,6 @@ def build_full_dashboard(rides, name, annual_goal=None, user_timezone=None):
 
         + "<h1>&#x1F6B4; " + name + "'s Cycling Dashboard " + str(YEAR) + "</h1>"
         + "<p class='subtitle'>Updated " + date.today().strftime('%B %d, %Y') + " &nbsp;&middot;&nbsp; " + str(len(rides)) + " rides" + goal_subtitle + "</p>"
-
-        + synopsis_card
 
         + "<div class='stats-grid'>"
         + "<div class='stat-card green'><div class='label'>Year Total</div>"
@@ -2582,6 +2592,28 @@ async def get_coaching_summary(user, metrics, ride_id=None):
                             ON CONFLICT (user_id, theme) DO UPDATE SET content=EXCLUDED.content, updated_at=NOW()
                         """, (user['id'], theme_key, content))
                 cur2.close(); conn2.close()
+
+        # v2.25.0 fix: the block above only writes a Ride History entry
+        # (coaching_memory_log) when the AI's own MEMORY_UPDATE judged this
+        # ride "worth remembering" — genuinely optional per its own prompt
+        # instructions. Meanwhile coaching_synopsis (the Dashboard card)
+        # gets written unconditionally below, for every upload. That gap is
+        # exactly why Marc's Aug 12 ride showed a full assessment on
+        # Dashboard but never appeared in Ride History at all — the AI
+        # simply didn't emit a dated_entry for it. Every assessed ride now
+        # always gets a Ride History entry using its own date and the same
+        # assessment text already generated; ON CONFLICT means if the AI's
+        # own MEMORY_UPDATE above already wrote something more specific for
+        # this exact date, this won't overwrite a better summary with a
+        # worse one — it only fills the entry in when nothing exists yet.
+        if ride_id and metrics.get('ride_date'):
+            conn4 = get_db(); cur4 = conn4.cursor()
+            cur4.execute("""
+                INSERT INTO coaching_memory_log (user_id, entry_date, summary)
+                VALUES (%s,%s,%s)
+                ON CONFLICT (user_id, entry_date) DO NOTHING
+            """, (user['id'], metrics['ride_date'], assessment_text[:600]))
+            cur4.close(); conn4.close()
 
         return assessment_text
     except Exception as e:
@@ -4024,6 +4056,45 @@ def set_strava_id(ride_id: int, strava_activity_id: int = Form(...), user: dict 
     if not updated:
         raise HTTPException(status_code=404, detail="Ride not found")
     return {"status": "updated", "id": ride_id, "strava_activity_id": strava_activity_id}
+
+# v2.25.0: safe allowlist for correct_ride_field below — numeric-only fields
+# where a device sensor glitch (dropout, misread, momentary garbage value)
+# can produce an obviously-wrong stored number with no way to fix it except
+# by hand. Deliberately excludes anything structural (ride_date, user_id,
+# possible_duplicate_of, strava_activity_id — the last one has its own
+# dedicated endpoint above since it needs int validation, not float).
+CORRECTABLE_FIELDS = {
+    'avg_power', 'norm_power', 'avg_hr', 'max_hr', 'avg_cadence', 'max_cadence',
+    'p5', 'p15', 'p30', 'p300', 'elev_gain_ft', 'elev_loss_ft', 'calories',
+    'avg_lr_balance', 'training_stress_score', 'intensity_factor', 'temp_c',
+}
+
+@app.post("/rides/{ride_id}/correct-field")
+def correct_ride_field(ride_id: int, field: str = Form(...), value: str = Form(default=""),
+                       user: dict = Depends(get_current_user)):
+    """Manual one-off correction, not part of normal app flow — for when a
+    device sensor reports an obviously-bad value (e.g. a cadence dropout
+    producing a 202rpm max on a ride that never touched half that) and the
+    only fix is a human confirming what actually happened and correcting
+    the stored number by hand. Restricted to CORRECTABLE_FIELDS so this
+    can't be used to touch anything structural. Empty value sets the field
+    to NULL rather than attempting to parse it as a number."""
+    if field not in CORRECTABLE_FIELDS:
+        raise HTTPException(status_code=400, detail=f"Field '{field}' is not correctable. Allowed: {sorted(CORRECTABLE_FIELDS)}")
+    parsed_value = None
+    if value.strip():
+        try:
+            parsed_value = float(value)
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"'{value}' is not a valid number")
+    conn = get_db(); cur = conn.cursor()
+    cur.execute(f"UPDATE rides SET {field}=%s WHERE id=%s AND user_id=%s",
+                (parsed_value, ride_id, user['id']))
+    updated = cur.rowcount
+    cur.close(); conn.close()
+    if not updated:
+        raise HTTPException(status_code=404, detail="Ride not found")
+    return {"status": "updated", "id": ride_id, "field": field, "value": parsed_value}
 
 @app.get("/rides/audit-slow-pace")
 def audit_slow_pace(user: dict = Depends(get_current_user)):
