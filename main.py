@@ -1,11 +1,18 @@
 # ═══════════════════════════════════════════════════════════════════
 # CYCLING COACH API — main.py
 #
-# VERSION: 2.25.1  (2026-08-14)
+# VERSION: 2.25.2  (2026-08-14)
 # Check this against GET / on the live Railway URL before assuming
 # a deploy has actually landed — the two should always match.
 #
 # CHANGELOG
+#   2.25.2 (2026-08-14) — added POST /rides/{id}/backfill-history, a
+#                         one-time helper to port an existing
+#                         coaching_synopsis into Ride History for
+#                         rides uploaded before v2.25.0's fix. Used
+#                         live on #1194 and #1195 (Aug 12, Aug 8) to
+#                         finally close out Marc's original "missing
+#                         the ride from the 8th" report.
 #   2.25.1 (2026-08-14) — added POST /rides/{id}/recompute-np, a
 #                         one-time backfill helper for rides created
 #                         before v2.24.2's normalized-power fix. Uses
@@ -1270,7 +1277,7 @@
 #   1.0.0                initial live build — dashboard, FIT upload,
 #                         Strava OAuth + sync, AI profile interview
 # ═══════════════════════════════════════════════════════════════════
-APP_VERSION = "2.25.1"
+APP_VERSION = "2.25.2"
 ADMIN_EMAILS = {"mtpujol@gmail.com"}
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Form
@@ -4133,6 +4140,35 @@ def recompute_np(ride_id: int, user: dict = Depends(get_current_user)):
     if not updated:
         raise HTTPException(status_code=404, detail="Ride not found")
     return {"status": "updated", "id": ride_id, "norm_power": np_val}
+
+@app.post("/rides/{ride_id}/backfill-history")
+def backfill_history(ride_id: int, user: dict = Depends(get_current_user)):
+    """One-time backfill helper, not part of normal app flow. v2.25.0 made
+    every FIT-uploaded ride's assessment always write a Ride History entry
+    — but only going forward. Rides uploaded before that fix already have
+    a coaching_synopsis saved (that's what the now-removed Dashboard card
+    was showing) but never got a coaching_memory_log entry, so they're
+    still invisible to Ride History. This ports the existing synopsis text
+    over by hand. ON CONFLICT DO NOTHING, same as the live fix — never
+    overwrites an entry that already exists for that date."""
+    conn = get_db(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT ride_date, coaching_synopsis FROM rides WHERE id=%s AND user_id=%s", (ride_id, user['id']))
+    ride = cur.fetchone()
+    if not ride:
+        cur.close(); conn.close()
+        raise HTTPException(status_code=404, detail="Ride not found")
+    if not ride['coaching_synopsis']:
+        cur.close(); conn.close()
+        raise HTTPException(status_code=400, detail="This ride has no saved coaching assessment to backfill from")
+    cur.execute("""
+        INSERT INTO coaching_memory_log (user_id, entry_date, summary)
+        VALUES (%s,%s,%s)
+        ON CONFLICT (user_id, entry_date) DO NOTHING
+        RETURNING entry_date
+    """, (user['id'], ride['ride_date'], ride['coaching_synopsis'][:600]))
+    inserted = cur.fetchone()
+    cur.close(); conn.close()
+    return {"status": "inserted" if inserted else "already_existed", "id": ride_id, "entry_date": str(ride['ride_date'])}
 
 @app.get("/rides/audit-slow-pace")
 def audit_slow_pace(user: dict = Depends(get_current_user)):
