@@ -1,11 +1,20 @@
 # ═══════════════════════════════════════════════════════════════════
 # CYCLING COACH API — main.py
 #
-# VERSION: 2.25.0  (2026-08-14)
+# VERSION: 2.25.1  (2026-08-14)
 # Check this against GET / on the live Railway URL before assuming
 # a deploy has actually landed — the two should always match.
 #
 # CHANGELOG
+#   2.25.1 (2026-08-14) — added POST /rides/{id}/recompute-np, a
+#                         one-time backfill helper for rides created
+#                         before v2.24.2's normalized-power fix. Uses
+#                         the ride's already-saved power stream and
+#                         the identical formula from parse_fit_bytes,
+#                         so old rides can be corrected without a
+#                         re-upload. Used live on ride #1194 (the Aug
+#                         12 ride whose NP/avg inversion originally
+#                         surfaced the v2.24.2 bug).
 #   2.25.0 (2026-08-14) — three fixes at Marc's request. (1) Removed
 #                         the "Latest Ride Assessment" card from
 #                         Dashboard — Marc correctly identified it as
@@ -1261,7 +1270,7 @@
 #   1.0.0                initial live build — dashboard, FIT upload,
 #                         Strava OAuth + sync, AI profile interview
 # ═══════════════════════════════════════════════════════════════════
-APP_VERSION = "2.25.0"
+APP_VERSION = "2.25.1"
 ADMIN_EMAILS = {"mtpujol@gmail.com"}
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Form
@@ -4095,6 +4104,35 @@ def correct_ride_field(ride_id: int, field: str = Form(...), value: str = Form(d
     if not updated:
         raise HTTPException(status_code=404, detail="Ride not found")
     return {"status": "updated", "id": ride_id, "field": field, "value": parsed_value}
+
+@app.post("/rides/{ride_id}/recompute-np")
+def recompute_np(ride_id: int, user: dict = Depends(get_current_user)):
+    """One-time backfill helper, not part of normal app flow. v2.24.2 fixed
+    norm_power to always be computed from the same zero-filtered power list
+    as avg_power, instead of trusting the device's own session-level field
+    (which computes over all samples including zeros, and could come out
+    BELOW avg_power). That fix only applies to new FIT uploads — rides
+    created before it still have whatever the device reported. This
+    recomputes norm_power from the ride's already-saved power stream using
+    the identical formula, so no re-upload is needed."""
+    conn = get_db(); cur = conn.cursor()
+    cur.execute("SELECT streams FROM ride_streams WHERE ride_id=%s", (ride_id,))
+    row = cur.fetchone()
+    if not row or not row[0] or not row[0].get('power'):
+        cur.close(); conn.close()
+        raise HTTPException(status_code=404, detail="No saved power stream for this ride")
+    powers = [p for p in row[0]['power'] if p and p > 0]
+    if len(powers) <= 30:
+        cur.close(); conn.close()
+        raise HTTPException(status_code=400, detail="Not enough power samples to compute normalized power")
+    smoothed = [sum(powers[max(0,i-29):i+1])/len(powers[max(0,i-29):i+1]) for i in range(len(powers))]
+    np_val = round((sum(x**4 for x in smoothed)/len(smoothed))**0.25)
+    cur.execute("UPDATE rides SET norm_power=%s WHERE id=%s AND user_id=%s", (np_val, ride_id, user['id']))
+    updated = cur.rowcount
+    cur.close(); conn.close()
+    if not updated:
+        raise HTTPException(status_code=404, detail="Ride not found")
+    return {"status": "updated", "id": ride_id, "norm_power": np_val}
 
 @app.get("/rides/audit-slow-pace")
 def audit_slow_pace(user: dict = Depends(get_current_user)):
