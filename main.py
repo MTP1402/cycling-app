@@ -1,11 +1,52 @@
 # ═══════════════════════════════════════════════════════════════════
 # CYCLING COACH API — main.py
 #
-# VERSION: 2.25.2  (2026-08-14)
+# VERSION: 2.26.0  (2026-08-14)
 # Check this against GET / on the live Railway URL before assuming
 # a deploy has actually landed — the two should always match.
 #
 # CHANGELOG
+#   2.26.0 (2026-08-14) — real structural limitation, confirmed by
+#                         Marc's own examples (7/14, 2/19, 5/31 —
+#                         all days with 2+ separate virtual sessions):
+#                         coaching_memory_log was keyed ONE ROW PER
+#                         CALENDAR DAY, full stop, via a plain
+#                         UNIQUE(user_id, entry_date) index. A second
+#                         ride on the same day didn't just risk being
+#                         missed — it silently overwrote whatever the
+#                         first ride's entry said. Fixed with a real
+#                         schema change: added ride_id to coaching_
+#                         memory_log, replaced the single unique index
+#                         with two partial ones — one entry per RIDE
+#                         when we know which ride it's about (every
+#                         FIT upload always does, via get_coaching_
+#                         summary), one entry per DAY only as a
+#                         fallback for free-form coaching-chat entries
+#                         not tied to any specific upload. Updated
+#                         every INSERT...ON CONFLICT site accordingly
+#                         (5 total), the AI-callable tool_get_dated_
+#                         log_entry to return multiple summaries for a
+#                         multi-ride day instead of silently picking
+#                         one, the /coaching/memory flagged-check query
+#                         to match by ride_id when available instead of
+#                         by date, and the frontend's Ride History
+#                         click-through to open by ride_id directly
+#                         instead of an ambiguous date lookup that
+#                         would've sent every same-day entry to the
+#                         same ride. Verified against a real local
+#                         Postgres instance (not just read through) —
+#                         ran the actual production migration SQL
+#                         against a simulated pre-existing old-schema
+#                         database, confirmed existing data survived
+#                         untouched, confirmed two same-day rides both
+#                         get independent entries that update in place
+#                         on re-sync without creating duplicates,
+#                         confirmed the date-only fallback path still
+#                         correctly caps at one entry per day, confirmed
+#                         the per-ride flagged check works, and
+#                         confirmed deleting a ride cascades to remove
+#                         its own orphaned Ride History entry without
+#                         touching any other ride's entry.
 #   2.25.2 (2026-08-14) — added POST /rides/{id}/backfill-history, a
 #                         one-time helper to port an existing
 #                         coaching_synopsis into Ride History for
@@ -1277,7 +1318,7 @@
 #   1.0.0                initial live build — dashboard, FIT upload,
 #                         Strava OAuth + sync, AI profile interview
 # ═══════════════════════════════════════════════════════════════════
-APP_VERSION = "2.25.2"
+APP_VERSION = "2.26.0"
 ADMIN_EMAILS = {"mtpujol@gmail.com"}
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Form
@@ -1397,13 +1438,29 @@ def init_db():
             id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id),
             entry_date DATE, summary TEXT, created_at TIMESTAMP DEFAULT NOW()
         );
+        ALTER TABLE coaching_memory_log ADD COLUMN IF NOT EXISTS ride_id INTEGER REFERENCES rides(id) ON DELETE CASCADE;
+        -- v2.26.0 fix: the plain UNIQUE(user_id, entry_date) below meant Ride
+        -- History could only ever hold ONE entry per calendar day, full stop
+        -- — a real, recurring problem for Marc, who regularly does 2-4
+        -- separate virtual sessions in a single day. Every one after the
+        -- first would silently overwrite or lose out to the last write.
+        -- Replaced with two partial unique indexes: one entry per RIDE when
+        -- we know which ride it's about (the common case now that uploads
+        -- always attach ride_id — see get_coaching_summary), and the old
+        -- one-per-day cap preserved ONLY as a fallback for free-form
+        -- coaching-chat entries that aren't tied to any specific upload.
+        DROP INDEX IF EXISTS idx_memory_log_user_date;
         -- Clean up any pre-existing duplicate dates (keep the most recent per
-        -- user+date) before locking in the uniqueness guarantee below. Safe to
-        -- run every startup — a no-op once there's nothing left to dedupe.
+        -- user+date) before locking in the uniqueness guarantee below — this
+        -- only matters for the ride_id IS NULL case now, but still needed
+        -- once, since old rows predate the ride_id column entirely.
         DELETE FROM coaching_memory_log a USING coaching_memory_log b
-            WHERE a.id < b.id AND a.user_id = b.user_id AND a.entry_date = b.entry_date;
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_log_user_date
-            ON coaching_memory_log (user_id, entry_date);
+            WHERE a.id < b.id AND a.user_id = b.user_id AND a.entry_date = b.entry_date
+            AND a.ride_id IS NULL AND b.ride_id IS NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_log_user_ride
+            ON coaching_memory_log (user_id, ride_id) WHERE ride_id IS NOT NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_log_user_date_noride
+            ON coaching_memory_log (user_id, entry_date) WHERE ride_id IS NULL;
         CREATE TABLE IF NOT EXISTS coaching_memory_themes (
             id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id),
             theme TEXT, content TEXT, updated_at TIMESTAMP DEFAULT NOW(),
@@ -2406,12 +2463,16 @@ def tool_search_rides_and_history(user_id, elevation_min_ft=None, elevation_max_
 
 def tool_get_dated_log_entry(user_id, date):
     conn = get_db(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute("SELECT entry_date, summary FROM coaching_memory_log WHERE user_id=%s AND entry_date=%s", (user_id, date))
-    row = cur.fetchone()
+    cur.execute("SELECT entry_date, summary FROM coaching_memory_log WHERE user_id=%s AND entry_date=%s ORDER BY id", (user_id, date))
+    rows = cur.fetchall()
     cur.close(); conn.close()
-    if not row:
+    if not rows:
         return {"error": f"No coaching log entry found for {date}"}
-    return {"date": str(row['entry_date']), "summary": row['summary']}
+    if len(rows) == 1:
+        return {"date": str(rows[0]['entry_date']), "summary": rows[0]['summary']}
+    # v2.26.0: multi-ride days (common for Marc — several virtual sessions
+    # in one day) can now have more than one entry per date.
+    return {"date": date, "count": len(rows), "summaries": [r['summary'] for r in rows]}
 
 def tool_get_power_curve(user_id, ride_id):
     """Relies on compute_power_curve()/estimate_ftp_from_curve()/
@@ -2593,11 +2654,24 @@ async def get_coaching_summary(user, metrics, ride_id=None):
                 conn2 = get_db(); cur2 = conn2.cursor()
                 de = mem_update.get('dated_entry')
                 if de and de.get('date') and de.get('summary'):
-                    cur2.execute("""
-                        INSERT INTO coaching_memory_log (user_id, entry_date, summary)
-                        VALUES (%s,%s,%s)
-                        ON CONFLICT (user_id, entry_date) DO UPDATE SET summary=EXCLUDED.summary
-                    """, (user['id'], de['date'], de['summary']))
+                    # v2.26.0: key by ride_id when we have one (every /upload
+                    # call does) so same-day rides each get their own entry,
+                    # instead of the old date-only key that let a second ride
+                    # on the same day silently overwrite the first.
+                    if ride_id:
+                        cur2.execute("""
+                            INSERT INTO coaching_memory_log (user_id, ride_id, entry_date, summary)
+                            VALUES (%s,%s,%s,%s)
+                            ON CONFLICT (user_id, ride_id) WHERE ride_id IS NOT NULL
+                            DO UPDATE SET summary=EXCLUDED.summary, entry_date=EXCLUDED.entry_date
+                        """, (user['id'], ride_id, de['date'], de['summary']))
+                    else:
+                        cur2.execute("""
+                            INSERT INTO coaching_memory_log (user_id, entry_date, summary)
+                            VALUES (%s,%s,%s)
+                            ON CONFLICT (user_id, entry_date) WHERE ride_id IS NULL
+                            DO UPDATE SET summary=EXCLUDED.summary
+                        """, (user['id'], de['date'], de['summary']))
                 tu = mem_update.get('theme_updates') or {}
                 for theme_key in MEMORY_THEMES:
                     content = tu.get(theme_key)
@@ -2612,23 +2686,23 @@ async def get_coaching_summary(user, metrics, ride_id=None):
         # v2.25.0 fix: the block above only writes a Ride History entry
         # (coaching_memory_log) when the AI's own MEMORY_UPDATE judged this
         # ride "worth remembering" — genuinely optional per its own prompt
-        # instructions. Meanwhile coaching_synopsis (the Dashboard card)
-        # gets written unconditionally below, for every upload. That gap is
-        # exactly why Marc's Aug 12 ride showed a full assessment on
-        # Dashboard but never appeared in Ride History at all — the AI
-        # simply didn't emit a dated_entry for it. Every assessed ride now
-        # always gets a Ride History entry using its own date and the same
-        # assessment text already generated; ON CONFLICT means if the AI's
-        # own MEMORY_UPDATE above already wrote something more specific for
-        # this exact date, this won't overwrite a better summary with a
-        # worse one — it only fills the entry in when nothing exists yet.
+        # instructions. Meanwhile coaching_synopsis (the Dashboard card,
+        # removed in v2.25.0) got written unconditionally. That gap is
+        # exactly why Marc's Aug 12 ride showed a full assessment but never
+        # appeared in Ride History at all. Every assessed ride now always
+        # gets a Ride History entry using its own date and the same
+        # assessment text already generated. v2.26.0: keyed by ride_id, same
+        # reasoning as above — ON CONFLICT DO NOTHING here just means it
+        # won't overwrite a richer summary the AI's own MEMORY_UPDATE above
+        # already wrote for this same ride.
         if ride_id and metrics.get('ride_date'):
             conn4 = get_db(); cur4 = conn4.cursor()
             cur4.execute("""
-                INSERT INTO coaching_memory_log (user_id, entry_date, summary)
-                VALUES (%s,%s,%s)
-                ON CONFLICT (user_id, entry_date) DO NOTHING
-            """, (user['id'], metrics['ride_date'], assessment_text[:600]))
+                INSERT INTO coaching_memory_log (user_id, ride_id, entry_date, summary)
+                VALUES (%s,%s,%s,%s)
+                ON CONFLICT (user_id, ride_id) WHERE ride_id IS NOT NULL
+                DO NOTHING
+            """, (user['id'], ride_id, metrics['ride_date'], assessment_text[:600]))
             cur4.close(); conn4.close()
 
         return assessment_text
@@ -3460,7 +3534,8 @@ async def coaching_chat(
                 cur2.execute("""
                     INSERT INTO coaching_memory_log (user_id, entry_date, summary)
                     VALUES (%s,%s,%s)
-                    ON CONFLICT (user_id, entry_date) DO UPDATE SET summary=EXCLUDED.summary
+                    ON CONFLICT (user_id, entry_date) WHERE ride_id IS NULL
+                    DO UPDATE SET summary=EXCLUDED.summary
                 """, (user['id'], de['date'], de['summary']))
             tu = mem_update.get('theme_updates') or {}
             for theme_key in MEMORY_THEMES:
@@ -3488,15 +3563,19 @@ def get_memory(user: dict = Depends(get_current_user)):
     it. Read-only enrichment; doesn't change what's stored."""
     conn = get_db(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("""
-        SELECT l.id, l.entry_date, l.summary,
+        SELECT l.id, l.entry_date, l.summary, l.ride_id,
             EXISTS(
                 SELECT 1 FROM rides r
-                WHERE r.user_id = %s AND r.ride_date = l.entry_date
+                WHERE r.user_id = %s
                     AND r.possible_duplicate_of IS NOT NULL
+                    AND (
+                        (l.ride_id IS NOT NULL AND r.id = l.ride_id)
+                        OR (l.ride_id IS NULL AND r.ride_date = l.entry_date)
+                    )
             ) AS flagged
         FROM coaching_memory_log l
         WHERE l.user_id = %s
-        ORDER BY l.entry_date DESC LIMIT 50
+        ORDER BY l.entry_date DESC, l.id DESC LIMIT 50
     """, (user['id'], user['id']))
     log = [dict(r) for r in cur.fetchall()]
     cur.execute("SELECT theme, content, updated_at FROM coaching_memory_themes WHERE user_id=%s", (user['id'],))
@@ -3609,7 +3688,8 @@ async def seed_memory(text: str = Form(...), user: dict = Depends(get_current_us
             cur.execute("""
                 INSERT INTO coaching_memory_log (user_id, entry_date, summary)
                 VALUES (%s,%s,%s)
-                ON CONFLICT (user_id, entry_date) DO UPDATE SET summary=EXCLUDED.summary
+                ON CONFLICT (user_id, entry_date) WHERE ride_id IS NULL
+                DO UPDATE SET summary=EXCLUDED.summary
             """, (user['id'], e['date'], e['summary']))
             added += 1
     updated_themes = []
@@ -4161,11 +4241,12 @@ def backfill_history(ride_id: int, user: dict = Depends(get_current_user)):
         cur.close(); conn.close()
         raise HTTPException(status_code=400, detail="This ride has no saved coaching assessment to backfill from")
     cur.execute("""
-        INSERT INTO coaching_memory_log (user_id, entry_date, summary)
-        VALUES (%s,%s,%s)
-        ON CONFLICT (user_id, entry_date) DO NOTHING
+        INSERT INTO coaching_memory_log (user_id, ride_id, entry_date, summary)
+        VALUES (%s,%s,%s,%s)
+        ON CONFLICT (user_id, ride_id) WHERE ride_id IS NOT NULL
+        DO NOTHING
         RETURNING entry_date
-    """, (user['id'], ride['ride_date'], ride['coaching_synopsis'][:600]))
+    """, (user['id'], ride_id, ride['ride_date'], ride['coaching_synopsis'][:600]))
     inserted = cur.fetchone()
     cur.close(); conn.close()
     return {"status": "inserted" if inserted else "already_existed", "id": ride_id, "entry_date": str(ride['ride_date'])}
