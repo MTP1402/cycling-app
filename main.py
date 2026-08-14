@@ -1,11 +1,29 @@
 # ═══════════════════════════════════════════════════════════════════
 # CYCLING COACH API — main.py
 #
-# VERSION: 2.23.1  (2026-08-13)
+# VERSION: 2.24.0  (2026-08-13)
 # Check this against GET / on the live Railway URL before assuming
 # a deploy has actually landed — the two should always match.
 #
 # CHANGELOG
+#   2.24.0 (2026-08-13) — Marc flagged a real recurring-conflict risk
+#                         before he'd even hit it: with v2.23.1 making
+#                         FIT-vs-Strava overlaps always flag (correctly,
+#                         per his request), resolving one by deleting
+#                         the Strava-sourced side left the surviving
+#                         FIT row with no strava_activity_id — so the
+#                         very next sync, with no local row carrying
+#                         that Strava activity's ID anymore, would
+#                         re-import a fresh Strava copy and re-flag it
+#                         against the same FIT row all over again,
+#                         forever, for as long as the ride stayed
+#                         inside the sync window. Fixed in delete_ride:
+#                         before deleting a row that carries a
+#                         strava_activity_id, if it's one side of a
+#                         flagged pair, that ID now transfers onto the
+#                         surviving side first (if it doesn't already
+#                         have one). Makes "keep FIT, delete Strava" an
+#                         actually permanent resolution.
 #   2.23.1 (2026-08-13) — at Marc's explicit request: removed the
 #                         v2.20.1 backfill-and-skip behavior for
 #                         time-overlap matches in strava_sync(). That
@@ -1176,7 +1194,7 @@
 #   1.0.0                initial live build — dashboard, FIT upload,
 #                         Strava OAuth + sync, AI profile interview
 # ═══════════════════════════════════════════════════════════════════
-APP_VERSION = "2.23.1"
+APP_VERSION = "2.24.0"
 ADMIN_EMAILS = {"mtpujol@gmail.com"}
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Form
@@ -3891,9 +3909,43 @@ def delete_ride(ride_id: int, user: dict = Depends(get_current_user)):
     """Delete a single ride. ride_streams cleans up automatically
     (ON DELETE CASCADE), and as of v2.20.2 so does any row that pointed
     at this one via possible_duplicate_of (ON DELETE SET NULL) — both
-    keyed off ride_id, neither can block this delete anymore."""
-    conn = get_db(); cur = conn.cursor()
+    keyed off ride_id, neither can block this delete anymore.
+
+    v2.24.0: before deleting, if this row carries a strava_activity_id
+    and it's one side of a flagged duplicate pair, transfer that ID onto
+    the surviving side first (if the survivor doesn't already have one).
+    Without this, resolving "keep the FIT copy, delete the Strava copy"
+    only fixes things until the next sync — with no row left carrying
+    that Strava activity's ID, the exact-ID check on a future sync finds
+    nothing, falls through to the overlap check, and recreates a fresh
+    Strava copy flagged against the same FIT row all over again. Marc
+    flagged this as a real recurring-conflict risk before he'd even hit
+    it: a ride he resolves once would keep re-flagging on every sync for
+    as long as it stays inside the sync window. This makes "keep FIT,
+    delete Strava" a genuinely permanent resolution instead of a weekly
+    chore."""
+    conn = get_db(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     try:
+        cur.execute("SELECT id, strava_activity_id, possible_duplicate_of FROM rides WHERE id=%s AND user_id=%s",
+                    (ride_id, user['id']))
+        target = cur.fetchone()
+        if target and target['strava_activity_id']:
+            # Counterpart is either the row this one points to, or a row
+            # that points back to this one — a flagged pair can be linked
+            # in either direction depending on which side synced second.
+            counterpart_id = target['possible_duplicate_of']
+            if counterpart_id is None:
+                cur.execute("SELECT id FROM rides WHERE possible_duplicate_of=%s AND user_id=%s LIMIT 1",
+                            (ride_id, user['id']))
+                other = cur.fetchone()
+                counterpart_id = other['id'] if other else None
+            if counterpart_id:
+                cur.execute("SELECT strava_activity_id FROM rides WHERE id=%s AND user_id=%s",
+                            (counterpart_id, user['id']))
+                counterpart = cur.fetchone()
+                if counterpart and not counterpart['strava_activity_id']:
+                    cur.execute("UPDATE rides SET strava_activity_id=%s WHERE id=%s AND user_id=%s",
+                                (target['strava_activity_id'], counterpart_id, user['id']))
         cur.execute("DELETE FROM rides WHERE id=%s AND user_id=%s", (ride_id, user['id']))
         deleted = cur.rowcount
     except Exception as e:
